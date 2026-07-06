@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "matchbook/matching_engine.hpp"
+#include "matchbook/mold_udp64.hpp"
 #include "matchbook/spsc_ring.hpp"
 #include "matchbook/level_bitmap.hpp"
 
@@ -242,6 +243,59 @@ static void test_spsc_ring() {
     CHECK(!ring.try_pop(v));
 }
 
+static void test_mold_udp64() {
+    // Round trip: three blocks, per-message sequence numbers, payloads.
+    std::vector<std::vector<uint8_t>> msgs = {
+        {'a', 'b', 'c'}, {'d'}, {'e', 'f'}};
+    std::vector<uint8_t> pkt;
+    mold::encode("SESH", 7, msgs, pkt);
+
+    mold::Header hdr;
+    std::vector<uint64_t> seqs;
+    std::vector<std::vector<uint8_t>> got;
+    int64_t n = mold::decode(pkt.data(), pkt.size(), hdr, [&](
+        uint64_t seq, const uint8_t* p, size_t len) {
+        seqs.push_back(seq);
+        got.emplace_back(p, p + len);
+    });
+    CHECK(n == 3);
+    CHECK(std::memcmp(hdr.session, "SESH      ", 10) == 0);
+    CHECK(hdr.seq == 7);
+    CHECK(seqs == (std::vector<uint64_t>{7, 8, 9}));
+    CHECK(got == msgs);
+
+    // Heartbeat (empty packet) and end-of-session.
+    pkt.clear();
+    mold::encode("SESH", 10, {}, pkt);
+    n = mold::decode(pkt.data(), pkt.size(), hdr,
+                     [&](uint64_t, const uint8_t*, size_t) { CHECK(false); });
+    CHECK(n == 0 && hdr.count == 0);
+    pkt.clear();
+    mold::encode_end("SESH", 10, pkt);
+    n = mold::decode(pkt.data(), pkt.size(), hdr,
+                     [&](uint64_t, const uint8_t*, size_t) { CHECK(false); });
+    CHECK(n == 0 && hdr.count == mold::kEndOfSession);
+
+    // Malformed: truncated header; block length running past the end.
+    pkt.clear();
+    mold::encode("SESH", 1, msgs, pkt);
+    auto nop = [](uint64_t, const uint8_t*, size_t) {};
+    CHECK(mold::decode(pkt.data(), 10, hdr, nop) == -1);
+    CHECK(mold::decode(pkt.data(), pkt.size() - 1, hdr, nop) == -1);
+
+    // Sequence tracking: in order, duplicate, overlap, gap.
+    mold::SequenceTracker t;
+    CHECK(t.on_packet(1, 3) == 0);   // 1..3 fresh
+    CHECK(t.expected() == 4);
+    CHECK(t.on_packet(1, 3) == 3);   // full duplicate, skip all
+    CHECK(t.expected() == 4);
+    CHECK(t.on_packet(3, 3) == 1);   // overlap: skip 3, apply 4..5
+    CHECK(t.expected() == 6);
+    CHECK(t.on_packet(9, 2) == 0);   // gap: 6..8 lost
+    CHECK(t.gap_messages() == 3);
+    CHECK(t.expected() == 11);
+}
+
 static void test_stress_invariants() {
     // Randomized fuzz: after every op, best bid < best ask (no locked or
     // crossed book) and open-order accounting stays consistent.
@@ -291,6 +345,7 @@ int main() {
     test_band_rejection();
     test_bitmap();
     test_spsc_ring();
+    test_mold_udp64();
     test_stress_invariants();
 
     if (g_failures == 0) {

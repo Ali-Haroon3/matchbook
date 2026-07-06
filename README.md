@@ -119,7 +119,11 @@ cmake --build build-asan --target tests && ./build-asan/tests
 ### Replaying real Nasdaq data
 
 `replay` reads the standard TotalView-ITCH 5.0 file format (2-byte
-big-endian length prefix per message). Nasdaq publishes free full-day
+big-endian length prefix per message). For the wire transport,
+`mold_udp64.hpp` implements MoldUDP64 framing: packet encode/decode
+(including heartbeats and end-of-session) plus a `SequenceTracker` that
+skips duplicate blocks and accounts for gaps across lossy/reordered
+packets. Nasdaq publishes free full-day
 sample files (emma.nasdaq.com); decompress one and run:
 
 ```bash
@@ -154,15 +158,17 @@ of the model.
 `tests/test_engine.cpp` covers price-time priority, execution at the
 maker's price, partial fills, market-order sweep and remainder discard,
 cancel edge cases, amend-vs-replace priority semantics, modifies that
-cross the book, IOC/FOK time-in-force, band rejection, the bitmap, and
-the ring, plus a 200k-op randomized fuzz (limits, cancels, markets,
+cross the book, IOC/FOK time-in-force, band rejection, the bitmap,
+MoldUDP64 framing (round trip, control packets, malformed input, gap
+tracking), and the ring, plus a 200k-op randomized fuzz (limits, cancels,
+markets,
 IOC/FOK) that asserts book invariants (never locked or crossed,
 consistent open-order accounting) after every operation. CI runs the
 suite in Release and under ASAN + UBSAN.
 
 ## Roadmap
 
-- MoldUDP64 framing for live multicast replay
+- Live multicast replay tool (UDP receiver over the MoldUDP64 codec)
 - RL market-making agent trained against the simulator (AS as the baseline)
 - pybind11 bindings for research/backtest workflows
 
