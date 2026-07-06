@@ -90,6 +90,7 @@ without losing queue position.
 | Operation       | Behavior                                                        |
 |-----------------|-----------------------------------------------------------------|
 | `submit_limit`  | Matches while crossed (price-time priority, executes at the resting order's price), rests the remainder |
+| &nbsp;&nbsp;`IOC` / `FOK` | IOC cancels the unfilled remainder instead of resting it; FOK pre-checks depth at-or-better than the limit (bitmap hop over level totals) and fills completely or executes nothing |
 | `submit_market` | Matches until filled or book exhausted; remainder is discarded  |
 | `cancel`        | O(1) by id                                                      |
 | `modify`        | Amend-down in place keeps priority; reprice/upsize is cancel-replace |
@@ -153,14 +154,14 @@ of the model.
 `tests/test_engine.cpp` covers price-time priority, execution at the
 maker's price, partial fills, market-order sweep and remainder discard,
 cancel edge cases, amend-vs-replace priority semantics, modifies that
-cross the book, band rejection, the bitmap, and the ring, plus a 200k-op
-randomized fuzz that asserts book invariants (never locked or crossed,
+cross the book, IOC/FOK time-in-force, band rejection, the bitmap, and
+the ring, plus a 200k-op randomized fuzz (limits, cancels, markets,
+IOC/FOK) that asserts book invariants (never locked or crossed,
 consistent open-order accounting) after every operation. CI runs the
 suite in Release and under ASAN + UBSAN.
 
 ## Roadmap
 
-- IOC / FOK time-in-force
 - MoldUDP64 framing for live multicast replay
 - RL market-making agent trained against the simulator (AS as the baseline)
 - pybind11 bindings for research/backtest workflows

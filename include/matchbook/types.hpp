@@ -12,6 +12,11 @@ inline constexpr OrderId kInvalidOrderId = 0;
 
 enum class Side : uint8_t { Buy = 0, Sell = 1 };
 
+// GTC: match, rest the remainder (default).
+// IOC: match, cancel the remainder instead of resting it.
+// FOK: fill the entire quantity immediately or execute nothing at all.
+enum class TimeInForce : uint8_t { GTC = 0, IOC = 1, FOK = 2 };
+
 inline Side opposite(Side s) noexcept {
     return s == Side::Buy ? Side::Sell : Side::Buy;
 }

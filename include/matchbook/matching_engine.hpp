@@ -18,7 +18,8 @@
 //
 // Semantics:
 //   * submit_limit: matches immediately against the opposite side while
-//     crossed, then rests any remainder.
+//     crossed, then rests any remainder. Time-in-force: GTC rests the
+//     remainder, IOC cancels it, FOK executes fully or not at all.
 //   * submit_market: matches until filled or the book is exhausted;
 //     the remainder is discarded (never rests).
 //   * cancel: O(1) removal by id.
@@ -67,15 +68,22 @@ public:
     // --- order entry -----------------------------------------------------
 
     // Returns the assigned order id, or kInvalidOrderId if the price is
-    // outside the book's band.
-    OrderId submit_limit(Side side, Price price, Qty qty) {
+    // outside the book's band. IOC cancels any unfilled remainder instead
+    // of resting it; FOK executes fully or not at all (killed via
+    // on_cancel with no trades).
+    OrderId submit_limit(Side side, Price price, Qty qty,
+                         TimeInForce tif = TimeInForce::GTC) {
         if (!in_band(price) || qty == 0) [[unlikely]] {
             h_.on_reject(kInvalidOrderId);
             return kInvalidOrderId;
         }
         OrderId id = next_id();
         h_.on_accept(id, side, price, qty);
-        place_limit(id, side, price, qty);
+        if (tif == TimeInForce::FOK && fillable(side, price, qty) < qty) {
+            h_.on_cancel(id);
+            return id;
+        }
+        place_limit(id, side, price, qty, tif);
         return id;
     }
 
@@ -179,13 +187,36 @@ private:
         return static_cast<OrderId>(orders_.size() - 1);
     }
 
-    // Match then rest the remainder. `id` must already be registered.
-    void place_limit(OrderId id, Side side, Price price, Qty qty) {
+    // Match, then rest (GTC) or cancel (IOC/FOK) the remainder. `id` must
+    // already be registered. FOK feasibility is checked by the caller, so
+    // an FOK reaching here always fills completely.
+    void place_limit(OrderId id, Side side, Price price, Qty qty,
+                     TimeInForce tif = TimeInForce::GTC) {
         int64_t limit_idx = static_cast<int64_t>(idx(price));
         Qty remaining = (side == Side::Buy)
             ? match_buy(id, qty, limit_idx)
             : match_sell(id, qty, limit_idx);
-        if (remaining > 0) rest(id, side, price, remaining);
+        if (remaining > 0) {
+            if (tif == TimeInForce::GTC) rest(id, side, price, remaining);
+            else                         h_.on_cancel(id);
+        }
+    }
+
+    // Resting qty on the opposite side priced at-or-better than `price`,
+    // capped at `want`: the scan stops as soon as enough is found.
+    Qty fillable(Side side, Price price, Qty want) const noexcept {
+        int64_t limit = static_cast<int64_t>(idx(price));
+        Qty sum = 0;
+        if (side == Side::Buy) {
+            for (int64_t i = best_ask_; i >= 0 && i <= limit && sum < want;
+                 i = ask_map_.find_ge(i + 1))
+                sum += asks_[static_cast<size_t>(i)].total;
+        } else {
+            for (int64_t i = best_bid_; i >= 0 && i >= limit && sum < want;
+                 i = bid_map_.find_le(i - 1))
+                sum += bids_[static_cast<size_t>(i)].total;
+        }
+        return sum;
     }
 
     // Aggressive buy: lift asks from best_ask_ upward while <= limit_idx.

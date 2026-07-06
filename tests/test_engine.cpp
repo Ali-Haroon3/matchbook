@@ -147,6 +147,62 @@ static void test_modify_can_cross() {
     CHECK(!e.has_ask() && !e.has_bid());
 }
 
+static void test_ioc() {
+    Recorder r;
+    Engine e(1, 10000, r);
+    e.submit_limit(Side::Sell, 100, 5);
+
+    // Partial fill: remainder is cancelled, never rests.
+    OrderId ioc = e.submit_limit(Side::Buy, 100, 8, TimeInForce::IOC);
+    CHECK(r.trades.size() == 1 && r.trades[0].qty == 5);
+    CHECK(!e.has_bid());
+    CHECK(r.cancels.size() == 1 && r.cancels[0] == ioc);
+    CHECK(e.open_orders() == 0);
+
+    // No cross at all: nothing trades, nothing rests.
+    OrderId miss = e.submit_limit(Side::Buy, 50, 3, TimeInForce::IOC);
+    CHECK(r.trades.size() == 1);
+    CHECK(!e.has_bid());
+    CHECK(r.cancels.back() == miss);
+
+    // Full fill: no cancel emitted.
+    e.submit_limit(Side::Sell, 100, 5);
+    r.cancels.clear();
+    e.submit_limit(Side::Buy, 100, 5, TimeInForce::IOC);
+    CHECK(r.trades.size() == 2);
+    CHECK(r.cancels.empty());
+    CHECK(!e.has_ask());
+}
+
+static void test_fok() {
+    Recorder r;
+    Engine e(1, 10000, r);
+    e.submit_limit(Side::Sell, 100, 5);
+    e.submit_limit(Side::Sell, 102, 5);
+
+    // Liquidity beyond the limit price doesn't count: killed, book intact.
+    OrderId kill = e.submit_limit(Side::Buy, 101, 10, TimeInForce::FOK);
+    CHECK(r.trades.empty());
+    CHECK(r.cancels.size() == 1 && r.cancels[0] == kill);
+    CHECK(e.depth_at(Side::Sell, 100) == 5);
+    CHECK(e.depth_at(Side::Sell, 102) == 5);
+
+    // Exactly enough across two levels: fills completely.
+    e.submit_limit(Side::Buy, 102, 10, TimeInForce::FOK);
+    CHECK(r.trades.size() == 2);
+    CHECK(r.trades[0].price == 100 && r.trades[1].price == 102);
+    CHECK(!e.has_ask());
+    CHECK(e.open_orders() == 0);
+
+    // Sell-side FOK against bids.
+    e.submit_limit(Side::Buy, 100, 4);
+    OrderId k2 = e.submit_limit(Side::Sell, 100, 5, TimeInForce::FOK);
+    CHECK(r.cancels.back() == k2);
+    CHECK(e.depth_at(Side::Buy, 100) == 4);
+    e.submit_limit(Side::Sell, 100, 4, TimeInForce::FOK);
+    CHECK(!e.has_bid());
+}
+
 static void test_band_rejection() {
     Recorder r;
     Engine e(100, 200, r);
@@ -206,9 +262,14 @@ static void test_stress_invariants() {
             e.cancel(live[k]);  // may already be gone; that's the point
             live[k] = live.back();
             live.pop_back();
-        } else {
+        } else if (roll < 95) {
             e.submit_market((rng() & 1) ? Side::Buy : Side::Sell,
                             1 + rng() % 100);
+        } else {
+            // IOC/FOK never rest, so their ids don't join `live`.
+            e.submit_limit((rng() & 1) ? Side::Buy : Side::Sell, px,
+                           1 + rng() % 50,
+                           (roll & 1) ? TimeInForce::IOC : TimeInForce::FOK);
         }
         if (e.has_bid() && e.has_ask()) CHECK(e.best_bid() < e.best_ask());
     }
@@ -225,6 +286,8 @@ int main() {
     test_cancel();
     test_modify_priority_semantics();
     test_modify_can_cross();
+    test_ioc();
+    test_fok();
     test_band_rejection();
     test_bitmap();
     test_spsc_ring();
