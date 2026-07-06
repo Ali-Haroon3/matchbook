@@ -1,0 +1,4 @@
+build*/
+*.itch
+.cache/
+compile_commands.json

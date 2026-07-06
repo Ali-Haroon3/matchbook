@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: release
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Release -DMATCHBOOK_NATIVE=OFF"
+          - name: asan-ubsan
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Debug -DMATCHBOOK_SANITIZE=ON"
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build ${{ matrix.cmake_flags }}
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Smoke bench
+        if: matrix.name == 'release'
+        run: ./build/bench 1000000
