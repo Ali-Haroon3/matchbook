@@ -9,6 +9,7 @@
 #include "matchbook/mold_udp64.hpp"
 #include "matchbook/spsc_ring.hpp"
 #include "matchbook/level_bitmap.hpp"
+#include "matchbook/strategy/rl_quoter.hpp"
 
 using namespace matchbook;
 
@@ -331,6 +332,45 @@ static void test_stress_invariants() {
     CHECK(e.open_orders() == 0);
 }
 
+static void test_rl_quoter() {
+    using strategy::RLQuoter;
+    RLQuoter rl;
+
+    // Inventory bucketing clamps at the extremes and is symmetric-ish
+    // around flat (integer division truncates toward zero).
+    CHECK(rl.bucket(0) == RLQuoter::kInvRange);
+    CHECK(rl.bucket(49) == RLQuoter::kInvRange);
+    CHECK(rl.bucket(-49) == RLQuoter::kInvRange);
+    CHECK(rl.bucket(50) == RLQuoter::kInvRange + 1);
+    CHECK(rl.bucket(-50) == RLQuoter::kInvRange - 1);
+    CHECK(rl.bucket(1000000) == RLQuoter::kStates - 1);
+    CHECK(rl.bucket(-1000000) == 0);
+
+    // Quotes never cross themselves, whatever the action.
+    for (long inv : {-500L, 0L, 500L}) {
+        auto q = rl.quotes(20000.0, inv, 0.0);
+        CHECK(q.ask > q.bid);
+    }
+
+    // One Q-learning step from a zero table: Q(s,a) = alpha * reward.
+    strategy::RLParams p;
+    RLQuoter fresh(p);
+    fresh.quotes(20000.0, 0, 0.0);  // greedy on a zero table picks action 0
+    fresh.learn(10.0, 0);
+    CHECK(std::abs(fresh.q_value(fresh.bucket(0), 0) - p.alpha * 10.0) < 1e-12);
+    // Second update bootstraps off the improved state value:
+    // Q += alpha * (r + discount * maxQ(s') - Q)
+    double q1 = fresh.q_value(fresh.bucket(0), 0);
+    fresh.quotes(20000.0, 0, 0.0);
+    fresh.learn(10.0, 0);
+    double expect = q1 + p.alpha * (10.0 + p.discount * q1 - q1);
+    CHECK(std::abs(fresh.q_value(fresh.bucket(0), 0) - expect) < 1e-12);
+    // learn() before any quotes() is a no-op, not UB.
+    RLQuoter idle;
+    idle.learn(5.0, 0);
+    CHECK(idle.q_value(idle.bucket(0), 0) == 0.0);
+}
+
 int main() {
     test_basic_match();
     test_price_time_priority();
@@ -347,6 +387,7 @@ int main() {
     test_spsc_ring();
     test_mold_udp64();
     test_stress_invariants();
+    test_rl_quoter();
 
     if (g_failures == 0) {
         std::printf("OK: %d checks passed\n", g_checks);

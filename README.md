@@ -104,7 +104,7 @@ cmake --build build -j
 
 ./build/tests                      # correctness suite (~193k checks)
 ./build/bench 10000000             # throughput + latency percentiles
-./build/mmsim 100000 0.1           # AS vs symmetric market making
+./build/mmsim 100000 0.1           # AS vs symmetric vs Q-learning market making
 ./build/itchgen /tmp/sample.itch 2000000
 ./build/replay /tmp/sample.itch MBTEST
 ```
@@ -138,20 +138,36 @@ book from the A/F/E/C/X/D/U lifecycle over the SPSC ring.
 `strategy/avellaneda_stoikov.hpp` implements the closed-form
 Avellaneda-Stoikov (2008) quotes: a reservation price skewed against
 current inventory plus an optimal half-spread driven by risk aversion,
-volatility, and time horizon. `mmsim` runs the agent against random
-background flow and compares it with a naive symmetric quoter at the same
-spread. Representative output (100k steps x 5 runs):
+volatility, and time horizon.
+
+`strategy/rl_quoter.hpp` is a tabular Q-learning market maker trained
+against the same simulator, with AS as the baseline. State is the current
+inventory in coarse buckets; an action picks the bid and ask offsets from
+mid independently (the widest offset sits past the background-flow band,
+so it doubles as "pull this side"); reward is the per-step mark-to-market
+change minus a quadratic inventory penalty. The whole policy is a
+61-state x 16-action table -- no function approximation, no external
+dependencies, trains in seconds.
+
+`mmsim` trains the Q-learner (15 runs, epsilon annealed to zero, seeds
+disjoint from evaluation), then compares all three quoters on held-out
+seeds. Representative output (100k steps x 5 runs):
 
 ```
 strategy       PnL(ticks)  final inv    max |inv|    fills
-AS                 222807        370         1707    98893
-symmetric          532573      10760        19221   123885
+AS                 224866        412         1600    98964
+symmetric          563338      10139        18980   123912
+RL(Q)              526373         69          154    84120
 ```
 
-The symmetric quoter's larger mark-to-market PnL comes with ~11x the peak
-inventory: it is mostly unhedged directional exposure, not edge. The AS
-skew keeps inventory mean-reverting around zero, which is the entire point
-of the model.
+The symmetric quoter's larger mark-to-market PnL comes with ~12x the peak
+inventory of AS: it is mostly unhedged directional exposure, not edge. The
+AS skew keeps inventory mean-reverting around zero, which is the entire
+point of the model. The Q-learner rediscovers that skew from reward alone
+-- asymmetric offsets when inventoried, pulling a side when it gets long
+or short -- and in this sim beats AS on both PnL and peak inventory,
+mostly because it also learns to quote tighter than the closed form
+(whose arrival-rate assumptions don't match this flow) dares to.
 
 ## Testing
 
@@ -160,7 +176,8 @@ maker's price, partial fills, market-order sweep and remainder discard,
 cancel edge cases, amend-vs-replace priority semantics, modifies that
 cross the book, IOC/FOK time-in-force, band rejection, the bitmap,
 MoldUDP64 framing (round trip, control packets, malformed input, gap
-tracking), and the ring, plus a 200k-op randomized fuzz (limits, cancels,
+tracking), the ring, and the Q-learning quoter (bucketing bounds, update
+math, uncrossed quotes), plus a 200k-op randomized fuzz (limits, cancels,
 markets,
 IOC/FOK) that asserts book invariants (never locked or crossed,
 consistent open-order accounting) after every operation. CI runs the
@@ -169,7 +186,7 @@ suite in Release and under ASAN + UBSAN.
 ## Roadmap
 
 - Live multicast replay tool (UDP receiver over the MoldUDP64 codec)
-- RL market-making agent trained against the simulator (AS as the baseline)
+- ~~RL market-making agent trained against the simulator (AS as the baseline)~~ done: `strategy/rl_quoter.hpp`
 - pybind11 bindings for research/backtest workflows
 
 ## License

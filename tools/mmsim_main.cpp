@@ -1,8 +1,9 @@
 // Market-making simulation: an Avellaneda-Stoikov agent quotes into the
 // book while random background flow (passive orders + aggressive takers)
 // trades around a mean-reverting fundamental. Compares AS against a naive
-// symmetric quoter at the same spread budget to show what the inventory
-// skew buys you.
+// symmetric quoter at the same spread budget (what the inventory skew buys
+// you) and against a tabular Q-learning quoter trained in the same sim
+// (whether the skew can be learned from reward alone).
 //
 //   usage: mmsim [steps] [gamma]
 #include <cmath>
@@ -12,10 +13,12 @@
 
 #include "matchbook/matching_engine.hpp"
 #include "matchbook/strategy/avellaneda_stoikov.hpp"
+#include "matchbook/strategy/rl_quoter.hpp"
 
 using namespace matchbook;
 using strategy::ASParams;
 using strategy::AvellanedaStoikov;
+using strategy::RLQuoter;
 
 namespace {
 
@@ -58,11 +61,18 @@ struct SimResult {
     uint64_t fills;
 };
 
-// mode 0 = Avellaneda-Stoikov, mode 1 = symmetric quotes at fixed spread
-SimResult run(int steps, double gamma, int mode, uint64_t seed) {
+// mode 0 = Avellaneda-Stoikov, mode 1 = symmetric quotes at fixed spread,
+// mode 2 = Q-learning quoter (pass rl; train=true enables updates).
+SimResult run(int steps, double gamma, int mode, uint64_t seed,
+              RLQuoter* rl = nullptr, bool train = false) {
+    // Inventory penalty for the RL reward: the learned analogue of gamma.
+    // Evaluation PnL below is unpenalized, so the table stays comparable.
+    constexpr double kInvPenalty = 1e-4;
+
     MMHandler h;
     MatchingEngine<MMHandler> e(1, 40000, h, 1 << 20);
     XorShift rng(seed);
+    double prev_value = 0.0;
 
     ASParams params;
     params.gamma = gamma;
@@ -97,9 +107,23 @@ SimResult run(int steps, double gamma, int mode, uint64_t seed) {
         if (e.has_bid() && e.has_ask())
             mid = 0.5 * (e.best_bid() + e.best_ask());
 
+        // Reward for the previous action: mark-to-market change minus an
+        // inventory penalty, observed now that the flow it caused has landed.
+        if (train && step > 0) {
+            double value = h.cash + h.inventory * mid;
+            double inv = static_cast<double>(h.inventory);
+            rl->learn(value - prev_value - kInvPenalty * inv * inv, h.inventory);
+            prev_value = value;
+        } else if (train) {
+            prev_value = h.cash + h.inventory * mid;
+        }
+
         Price bid_px, ask_px;
         if (mode == 0) {
             auto q = as.quotes(mid, h.inventory, t);
+            bid_px = q.bid; ask_px = q.ask;
+        } else if (mode == 2) {
+            auto q = rl->quotes(mid, h.inventory, t);
             bid_px = q.bid; ask_px = q.ask;
         } else {
             // Same average spread as AS at q=0, but no inventory skew.
@@ -139,26 +163,39 @@ int main(int argc, char** argv) {
     double gamma = (argc > 2) ? std::atof(argv[2]) : 0.1;
     constexpr int kRuns = 5;
 
-    std::printf("Avellaneda-Stoikov vs symmetric quoting, %d steps x %d runs, gamma=%.2f\n\n",
+    std::printf("Avellaneda-Stoikov vs symmetric vs Q-learning quoting, %d steps x %d runs, gamma=%.2f\n\n",
                 steps, kRuns, gamma);
+
+    // Train the Q-learning quoter on seeds disjoint from evaluation,
+    // epsilon annealed linearly to zero.
+    constexpr int kTrainRuns = 15;
+    RLQuoter rl;
+    for (int r = 0; r < kTrainRuns; ++r) {
+        rl.set_epsilon(0.3 * (kTrainRuns - r) / kTrainRuns);
+        run(steps, gamma, 2, 500000 + 104729ull * r, &rl, true);
+    }
+    rl.set_epsilon(0.0);
+
     std::printf("%-12s %12s %10s %12s %8s\n",
                 "strategy", "PnL(ticks)", "final inv", "max |inv|", "fills");
 
-    for (int mode = 0; mode <= 1; ++mode) {
+    static const char* kNames[] = {"AS", "symmetric", "RL(Q)"};
+    for (int mode = 0; mode <= 2; ++mode) {
         double pnl_sum = 0; long maxinv = 0; uint64_t fills = 0;
         long final_inv_abs_sum = 0;
         for (int r = 0; r < kRuns; ++r) {
-            auto res = run(steps, gamma, mode, 1000 + 7919ull * r);
+            auto res = run(steps, gamma, mode, 1000 + 7919ull * r, &rl);
             pnl_sum += res.pnl;
             final_inv_abs_sum += std::labs(res.final_inv);
             if (res.max_abs_inv > maxinv) maxinv = res.max_abs_inv;
             fills += res.fills;
         }
         std::printf("%-12s %12.0f %10ld %12ld %8llu\n",
-                    mode == 0 ? "AS" : "symmetric",
+                    kNames[mode],
                     pnl_sum / kRuns, final_inv_abs_sum / kRuns, maxinv,
                     (unsigned long long)(fills / kRuns));
     }
-    std::printf("\n(AS should carry materially less inventory risk for similar or better PnL.)\n");
+    std::printf("\n(AS should carry materially less inventory risk for similar or better PnL;\n"
+                " RL(Q) should rediscover the inventory skew from reward alone.)\n");
     return 0;
 }
