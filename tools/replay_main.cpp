@@ -14,9 +14,9 @@
 #include <fstream>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
+#include "matchbook/itch_book_builder.hpp"
 #include "matchbook/itch_parser.hpp"
 #include "matchbook/matching_engine.hpp"
 #include "matchbook/spsc_ring.hpp"
@@ -83,9 +83,7 @@ int main(int argc, char** argv) {
     Stats h;
     // Band: $0.0001 .. $2000.0000 in 1/10000-dollar ticks.
     MatchingEngine<Stats> e(1, 20'000'000, h, 1 << 21);
-    // ITCH order reference -> engine order id.
-    std::unordered_map<uint64_t, OrderId> refmap;
-    refmap.reserve(1 << 20);
+    itch::BookBuilder book;
 
     uint64_t applied = 0;
     auto t0 = Clock::now();
@@ -96,48 +94,7 @@ int main(int argc, char** argv) {
                 g_ring.size_approx() == 0) break;
             continue;
         }
-        switch (m.type) {
-            case itch::MsgType::Add: {
-                OrderId id = e.submit_limit(m.side, m.price, m.qty);
-                if (id != kInvalidOrderId) refmap[m.ref] = id;
-                break;
-            }
-            case itch::MsgType::Execute:
-            case itch::MsgType::Cancel: {
-                auto it = refmap.find(m.ref);
-                if (it == refmap.end()) break;
-                // Partial reduce keeps priority (modify amend-down path);
-                // full size-out removes the order.
-                // We don't know remaining qty from the feed alone, so ask
-                // the book: reduce by min(m.qty, resting).
-                // Simplest correct handling: cancel if reduce-to-zero.
-                // ITCH guarantees exec/cancel qty <= remaining.
-                // Reduce via modify path:
-                // (engine keeps priority on amend-down at same price)
-                // We track nothing else per ref.
-                // If modify fails (order gone), drop the ref.
-                if (!e.reduce(it->second, m.qty)) refmap.erase(it);
-                break;
-            }
-            case itch::MsgType::Delete: {
-                auto it = refmap.find(m.ref);
-                if (it != refmap.end()) {
-                    e.cancel(it->second);
-                    refmap.erase(it);
-                }
-                break;
-            }
-            case itch::MsgType::Replace: {
-                auto it = refmap.find(m.ref);
-                if (it != refmap.end()) {
-                    OrderId id = it->second;
-                    refmap.erase(it);
-                    if (e.modify(id, m.price, m.qty)) refmap[m.new_ref] = id;
-                }
-                break;
-            }
-            default: break;
-        }
+        book.apply(e, m);
         ++applied;
     }
     auto t1 = Clock::now();

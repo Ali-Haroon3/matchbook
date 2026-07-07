@@ -38,10 +38,12 @@ mb_target(bench   bench/bench_main.cpp)
 mb_target(replay  tools/replay_main.cpp)
 mb_target(itchgen tools/itchgen_main.cpp)
 mb_target(mmsim   tools/mmsim_main.cpp)
+mb_target(mcast   tools/mcast_main.cpp)
 
 find_package(Threads REQUIRED)
 target_link_libraries(bench  PRIVATE Threads::Threads)
 target_link_libraries(replay PRIVATE Threads::Threads)
+target_link_libraries(mcast  PRIVATE Threads::Threads)
 
 enable_testing()
 add_test(NAME engine_tests COMMAND tests)

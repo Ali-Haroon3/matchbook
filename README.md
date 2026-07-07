@@ -107,6 +107,8 @@ cmake --build build -j
 ./build/mmsim 100000 0.1           # AS vs symmetric vs Q-learning market making
 ./build/itchgen /tmp/sample.itch 2000000
 ./build/replay /tmp/sample.itch MBTEST
+./build/mcast recv 239.192.0.1 26400 MBTEST 127.0.0.1 &   # live receiver
+./build/mcast send /tmp/sample.itch 239.192.0.1 26400 5000 127.0.0.1
 ```
 
 Sanitizer build:
@@ -132,6 +134,17 @@ sample files (emma.nasdaq.com); decompress one and run:
 
 The feed thread parses and filters; the matching thread reconstructs the
 book from the A/F/E/C/X/D/U lifecycle over the SPSC ring.
+
+`mcast` is the live wire-transport counterpart: `mcast send` frames an
+ITCH file into MTU-sized MoldUDP64 packets and multicasts them at a paced
+rate (ending with an end-of-session burst), and `mcast recv` joins the
+group, runs the codec's duplicate/gap accounting, and reconstructs the
+book through the same SPSC feed/matching pipeline as `replay` (the
+book-building logic is shared, `itch_book_builder.hpp`). The interface
+address argument selects the NIC, as production multicast feeds do;
+`127.0.0.1` runs the whole loop on loopback, where the received book is
+bit-identical to the file replay's. A receiver that misses the
+end-of-session packet exits after 5s of feed silence instead of hanging.
 
 ## Market-making layer
 
@@ -185,7 +198,7 @@ suite in Release and under ASAN + UBSAN.
 
 ## Roadmap
 
-- Live multicast replay tool (UDP receiver over the MoldUDP64 codec)
+- ~~Live multicast replay tool (UDP receiver over the MoldUDP64 codec)~~ done: `tools/mcast_main.cpp`
 - ~~RL market-making agent trained against the simulator (AS as the baseline)~~ done: `strategy/rl_quoter.hpp`
 - pybind11 bindings for research/backtest workflows
 
