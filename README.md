@@ -6,6 +6,8 @@ matching threads, and an Avellaneda-Stoikov market-making layer on top.
 
 Zero external dependencies. Header-only core. Builds clean with
 `-Wall -Wextra -Wpedantic -Wshadow` and runs clean under ASAN + UBSAN.
+Optional pybind11 bindings for research workflows (off by default; the
+core stays dependency-free).
 
 ## Benchmarks
 
@@ -118,6 +120,27 @@ cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug -DMATCHBOOK_SANITIZE=ON
 cmake --build build-asan --target tests && ./build-asan/tests
 ```
 
+### Python bindings
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DMATCHBOOK_PYTHON=ON  # fetches pybind11
+cmake --build build --target pymatchbook -j
+PYTHONPATH=build python3
+```
+
+```python
+import matchbook as mb
+e = mb.Engine(1, 10000)
+e.submit_limit(mb.Side.Sell, 100, 5)
+e.submit_limit(mb.Side.Buy, 100, 8, mb.TimeInForce.IOC)
+e.take_trades()   # [Trade(taker=2, maker=1, price=100, qty=5)]
+```
+
+The module exposes the engine (submit/cancel/modify/reduce, book state,
+a drainable trade list), the Avellaneda-Stoikov quoter, and the
+Q-learning quoter — enough to drive backtests or train policies from
+Python. `tests/test_bindings.py` is the smoke test; CI runs it.
+
 ### Replaying real Nasdaq data
 
 `replay` reads the standard TotalView-ITCH 5.0 file format (2-byte
@@ -200,7 +223,7 @@ suite in Release and under ASAN + UBSAN.
 
 - ~~Live multicast replay tool (UDP receiver over the MoldUDP64 codec)~~ done: `tools/mcast_main.cpp`
 - ~~RL market-making agent trained against the simulator (AS as the baseline)~~ done: `strategy/rl_quoter.hpp`
-- pybind11 bindings for research/backtest workflows
+- ~~pybind11 bindings for research/backtest workflows~~ done: `bindings/py_matchbook.cpp` (opt-in, `-DMATCHBOOK_PYTHON=ON`)
 
 ## License
 

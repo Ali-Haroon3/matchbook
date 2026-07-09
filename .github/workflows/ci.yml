@@ -15,6 +15,8 @@ jobs:
             cmake_flags: "-DCMAKE_BUILD_TYPE=Release -DMATCHBOOK_NATIVE=OFF"
           - name: asan-ubsan
             cmake_flags: "-DCMAKE_BUILD_TYPE=Debug -DMATCHBOOK_SANITIZE=ON"
+          - name: python
+            cmake_flags: "-DCMAKE_BUILD_TYPE=Release -DMATCHBOOK_NATIVE=OFF -DMATCHBOOK_PYTHON=ON"
     name: ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
@@ -27,3 +29,6 @@ jobs:
       - name: Smoke bench
         if: matrix.name == 'release'
         run: ./build/bench 1000000
+      - name: Python bindings test
+        if: matrix.name == 'python'
+        run: PYTHONPATH=build python3 tests/test_bindings.py
