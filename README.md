@@ -209,11 +209,13 @@ mostly because it also learns to quote tighter than the closed form
 
 `tests/test_engine.cpp` covers price-time priority, execution at the
 maker's price, partial fills, market-order sweep and remainder discard,
-cancel edge cases, amend-vs-replace priority semantics, modifies that
-cross the book, IOC/FOK time-in-force, band rejection, the bitmap,
-MoldUDP64 framing (round trip, control packets, malformed input, gap
-tracking), the ring, and the Q-learning quoter (bucketing bounds, update
-math, uncrossed quotes), plus a 200k-op randomized fuzz (limits, cancels,
+cancel edge cases, amend-vs-replace priority semantics and the
+cancel-replace event pair, modifies that cross the book, IOC/FOK
+time-in-force, band rejection, a rejected feed replace keeping its order
+reachable, the bitmap, MoldUDP64 framing (round trip, control packets,
+malformed input, gap tracking), the ring, and the Q-learning quoter
+(bucketing bounds, update math, uncrossed quotes), plus a 200k-op
+randomized fuzz (limits, cancels,
 markets,
 IOC/FOK) that asserts book invariants (never locked or crossed,
 consistent open-order accounting) after every operation. CI runs the

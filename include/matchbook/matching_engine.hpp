@@ -27,6 +27,10 @@
 //     (in-place amend); any price change or qty increase is treated as
 //     cancel-replace and goes to the back of the queue, re-matching on
 //     entry. This mirrors real exchange semantics (e.g. Nasdaq).
+//
+// Re-entrancy: the engine is single-threaded and NOT re-entrant. A Handler
+// callback fires mid-mutation and must not call back into submit_*/cancel/
+// modify/reduce (a debug-build assert enforces this).
 
 #include <cassert>
 #include <cstddef>
@@ -73,6 +77,7 @@ public:
     // on_cancel with no trades).
     OrderId submit_limit(Side side, Price price, Qty qty,
                          TimeInForce tif = TimeInForce::GTC) {
+        CallGuard guard(in_call_);
         if (!in_band(price) || qty == 0) [[unlikely]] {
             h_.on_reject(kInvalidOrderId);
             return kInvalidOrderId;
@@ -89,6 +94,7 @@ public:
 
     // Returns unfilled quantity (0 if fully filled).
     Qty submit_market(Side side, Qty qty) {
+        CallGuard guard(in_call_);
         OrderId id = next_id();
         h_.on_accept(id, side, 0, qty);
         Qty remaining = (side == Side::Buy)
@@ -98,19 +104,15 @@ public:
     }
 
     bool cancel(OrderId id) {
-        Order* o = lookup(id);
-        if (!o) return false;
-        remove_resting(o);
-        orders_[id] = nullptr;
-        pool_.free(o);
-        h_.on_cancel(id);
-        return true;
+        CallGuard guard(in_call_);
+        return cancel_impl(id);
     }
 
     // Reduce a resting order's quantity by `delta` (feed-driven partial
     // execution or partial cancel). Keeps time priority; removes the order
     // if it reduces to zero. Returns false if the order is unknown.
     bool reduce(OrderId id, Qty delta) {
+        CallGuard guard(in_call_);
         Order* o = lookup(id);
         if (!o) return false;
         if (delta >= o->qty) {
@@ -126,9 +128,10 @@ public:
 
     // See semantics note at top of file.
     bool modify(OrderId id, Price new_price, Qty new_qty) {
+        CallGuard guard(in_call_);
         Order* o = lookup(id);
         if (!o) return false;
-        if (new_qty == 0) return cancel(id);
+        if (new_qty == 0) return cancel_impl(id);
         if (!in_band(new_price)) return false;
 
         if (new_price == o->price && new_qty <= o->qty) {
@@ -138,11 +141,16 @@ public:
             o->qty = new_qty;
             return true;
         }
-        // Cancel-replace: loses priority, may match on re-entry.
+        // Cancel-replace: loses priority, may match on re-entry. Emit the
+        // cancel/accept pair so the event stream reflects the semantics --
+        // the old resting order is gone and a new one (same id) is accepted,
+        // mirroring submit_limit, which fires on_accept before it matches.
         Side side = o->side;
         remove_resting(o);
         orders_[id] = nullptr;
         pool_.free(o);
+        h_.on_cancel(id);
+        h_.on_accept(id, side, new_price, new_qty);
         place_limit(id, side, new_price, new_qty);
         return true;
     }
@@ -168,6 +176,42 @@ private:
         Order* head  = nullptr;
         Order* tail  = nullptr;
     };
+
+    // The engine is single-threaded and NOT re-entrant. Handler callbacks
+    // (on_trade/on_accept/on_cancel/on_reject) fire mid-mutation, while book
+    // pointers are being rewired and a node the matcher still holds may be
+    // live, so a callback must not call back into any submit_*/cancel/modify/
+    // reduce method -- doing so is undefined behavior (e.g. cancelling the
+    // order currently being swept frees the node sweep_level dereferences
+    // next). This RAII guard turns a violation into an assert under debug/
+    // ASAN builds and compiles to nothing in release.
+#ifndef NDEBUG
+    struct CallGuard {
+        bool* flag;
+        explicit CallGuard(bool& f) : flag(&f) {
+            assert(!f && "MatchingEngine is not re-entrant: a Handler "
+                         "callback must not call back into the engine");
+            f = true;
+        }
+        ~CallGuard() { *flag = false; }
+        CallGuard(const CallGuard&) = delete;
+        CallGuard& operator=(const CallGuard&) = delete;
+    };
+#else
+    struct CallGuard { explicit CallGuard(bool&) noexcept {} };
+#endif
+
+    // Shared cancel body, callable from modify() without tripping the
+    // re-entrancy guard the public cancel() holds.
+    bool cancel_impl(OrderId id) {
+        Order* o = lookup(id);
+        if (!o) return false;
+        remove_resting(o);
+        orders_[id] = nullptr;
+        pool_.free(o);
+        h_.on_cancel(id);
+        return true;
+    }
 
     bool in_band(Price p) const noexcept {
         return p >= min_ && p < min_ + static_cast<Price>(n_levels_);
@@ -325,6 +369,7 @@ private:
     Pool<Order> pool_;
     std::vector<Order*> orders_;  // id -> node (nullptr if gone/never rested)
     Handler& h_;
+    bool in_call_ = false;        // re-entrancy guard flag (see CallGuard)
 };
 
 }  // namespace matchbook

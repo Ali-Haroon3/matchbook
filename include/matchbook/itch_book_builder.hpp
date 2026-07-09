@@ -45,8 +45,13 @@ public:
                 auto it = refmap_.find(m.ref);
                 if (it == refmap_.end()) break;
                 OrderId id = it->second;
+                // Only rebind the ref once modify succeeds: a rejected
+                // replace (e.g. out-of-band price) must leave the order
+                // reachable under its old ref, not orphan it in the engine.
+                // Erase via `it` before the insert to avoid invalidation.
+                if (!e.modify(id, m.price, m.qty)) break;
                 refmap_.erase(it);
-                if (e.modify(id, m.price, m.qty)) refmap_[m.new_ref] = id;
+                refmap_[m.new_ref] = id;
                 break;
             }
             default:

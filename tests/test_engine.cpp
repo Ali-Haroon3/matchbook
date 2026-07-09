@@ -3,8 +3,10 @@
 // (and cleanly under ASAN/UBSAN/TSAN in CI).
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 
+#include "matchbook/itch_book_builder.hpp"
 #include "matchbook/matching_engine.hpp"
 #include "matchbook/mold_udp64.hpp"
 #include "matchbook/spsc_ring.hpp"
@@ -136,6 +138,59 @@ static void test_modify_priority_semantics() {
     CHECK(r.trades.size() >= 2);
     CHECK(r.trades[0].maker == third);         // second lost its spot
     CHECK(r.trades[1].maker == second);
+}
+
+static void test_modify_events() {
+    // Cancel-replace (reprice) must emit on_cancel(old) then on_accept(new)
+    // so a handler is never left with a resting order it was never told
+    // about; an in-place amend-down emits neither.
+    struct Log {
+        std::vector<std::pair<char, OrderId>> ev;  // 'A'ccept / 'C'ancel
+        void on_accept(OrderId id, Side, Price, Qty) { ev.push_back({'A', id}); }
+        void on_trade(const Trade&) {}
+        void on_cancel(OrderId id) { ev.push_back({'C', id}); }
+        void on_reject(OrderId) {}
+    };
+    Log log;
+    MatchingEngine<Log> e(1, 10000, log);
+
+    OrderId id = e.submit_limit(Side::Buy, 100, 5);   // A(id)
+    CHECK(log.ev.size() == 1 && log.ev[0].first == 'A');
+
+    CHECK(e.modify(id, 100, 3));                       // amend down: no event
+    CHECK(log.ev.size() == 1);
+
+    CHECK(e.modify(id, 105, 3));                       // reprice: C(id), A(id)
+    CHECK(log.ev.size() == 3);
+    CHECK(log.ev[1].first == 'C' && log.ev[1].second == id);
+    CHECK(log.ev[2].first == 'A' && log.ev[2].second == id);
+    CHECK(e.best_bid() == 105 && e.open_orders() == 1);
+}
+
+static void test_book_builder_replace_reject() {
+    // A rejected Replace (out-of-band price) must leave the order reachable
+    // under its old ref, not erase the mapping and orphan it in the engine.
+    Recorder r;
+    Engine e(1, 10000, r);
+    itch::BookBuilder book;
+
+    itch::Message add{};
+    add.type = itch::MsgType::Add;
+    add.ref = 999; add.side = Side::Buy; add.qty = 5; add.price = 100;
+    book.apply(e, add);
+    CHECK(e.best_bid() == 100 && e.open_orders() == 1);
+
+    itch::Message bad{};
+    bad.type = itch::MsgType::Replace;
+    bad.ref = 999; bad.new_ref = 1000; bad.price = 999999; bad.qty = 5;
+    book.apply(e, bad);                     // modify() rejects: out of band
+    CHECK(e.open_orders() == 1 && e.best_bid() == 100);
+
+    itch::Message del{};
+    del.type = itch::MsgType::Delete;
+    del.ref = 999;                          // old ref still resolves
+    book.apply(e, del);
+    CHECK(e.open_orders() == 0 && !e.has_bid());
 }
 
 static void test_modify_can_cross() {
@@ -379,6 +434,8 @@ int main() {
     test_market_order();
     test_cancel();
     test_modify_priority_semantics();
+    test_modify_events();
+    test_book_builder_replace_reject();
     test_modify_can_cross();
     test_ioc();
     test_fok();
