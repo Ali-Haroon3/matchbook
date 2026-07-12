@@ -1,8 +1,10 @@
 // Correctness tests for the matching engine. Zero external dependencies:
 // a tiny CHECK harness so the suite runs anywhere with a C++20 compiler
 // (and cleanly under ASAN/UBSAN/TSAN in CI).
+#include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -352,12 +354,14 @@ static void test_mold_udp64() {
     CHECK(t.expected() == 11);
 }
 
-static void test_stress_invariants() {
+template <typename Eng>
+static void stress_invariants(uint64_t seed) {
     // Randomized fuzz: after every op, best bid < best ask (no locked or
-    // crossed book) and open-order accounting stays consistent.
+    // crossed book) and open-order accounting stays consistent. Run against
+    // both the default and the deferred-event engine (same invariants hold).
     Recorder r;
-    Engine e(1, 2000, r, 1 << 16);
-    uint64_t s = 0x9E3779B97F4A7C15ull;
+    Eng e(1, 2000, r, 1 << 16);
+    uint64_t s = seed;
     auto rng = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
     std::vector<OrderId> live;
     for (int i = 0; i < 200000; ++i) {
@@ -385,6 +389,125 @@ static void test_stress_invariants() {
     }
     for (OrderId id : live) e.cancel(id);
     CHECK(e.open_orders() == 0);
+}
+
+static void test_stress_invariants() {
+    stress_invariants<MatchingEngine<Recorder>>(0x9E3779B97F4A7C15ull);
+    stress_invariants<ReentrantMatchingEngine<Recorder>>(0xD1B54A32D192ED03ull);
+}
+
+// Records the full ordered event tape so two engines can be compared.
+struct Tape {
+    std::vector<std::array<long, 4>> ev;  // {kind, id/maker, price, qty}
+    void on_accept(OrderId id, Side, Price p, Qty q) {
+        ev.push_back({'A', (long)id, (long)p, (long)q});
+    }
+    void on_trade(const Trade& t) {
+        ev.push_back({'T', (long)t.maker, (long)t.price, (long)t.qty});
+    }
+    void on_cancel(OrderId id) { ev.push_back({'C', (long)id, 0, 0}); }
+    void on_reject(OrderId id) { ev.push_back({'R', (long)id, 0, 0}); }
+};
+
+template <typename Eng>
+static void parity_script(Eng& e) {
+    e.submit_limit(Side::Sell, 100, 10);
+    e.submit_limit(Side::Sell, 101, 5);
+    e.submit_limit(Side::Buy, 100, 4);                     // partial fill
+    e.submit_limit(Side::Buy, 102, 12);                    // multi-level sweep + rest
+    e.submit_limit(Side::Buy, 100, 3, TimeInForce::IOC);   // IOC remainder cancel
+    e.submit_limit(Side::Sell, 90, 3, TimeInForce::FOK);   // FOK against the resting bid
+    OrderId x = e.submit_limit(Side::Buy, 98, 7);
+    e.modify(x, 105, 7);                                   // reprice: cancel + accept + match
+    e.cancel(x);
+    e.submit_market(Side::Sell, 100);                      // sweep whatever bids remain
+    e.submit_limit(Side::Sell, 50, 1);
+    e.submit_market(Side::Buy, 1);
+}
+
+static void test_reentrant_engine() {
+    // 1. Event parity: the deferred engine emits the exact same tape as the
+    //    default engine for a handler that does not re-enter -- same events,
+    //    same order, only the dispatch timing differs.
+    Tape fast, deferred;
+    MatchingEngine<Tape> ef(1, 10000, fast);
+    ReentrantMatchingEngine<Tape> ed(1, 10000, deferred);
+    parity_script(ef);
+    parity_script(ed);
+    CHECK(fast.ev.size() > 10);
+    CHECK(fast.ev == deferred.ev);
+
+    // 2. Safe re-entrancy: a handler that cancels the maker from inside
+    //    on_trade -- the exact pattern that use-after-frees the default
+    //    engine -- is well-defined here, because the cancel runs after
+    //    matching completes against a consistent book.
+    struct CancelMaker {
+        ReentrantMatchingEngine<CancelMaker>* e = nullptr;
+        OrderId maker = 0;
+        int cancels_ok = 0;
+        void on_accept(OrderId, Side, Price, Qty) {}
+        void on_trade(const Trade& t) {
+            if (t.maker == maker && e->cancel(maker)) ++cancels_ok;
+        }
+        void on_cancel(OrderId) {}
+        void on_reject(OrderId) {}
+    };
+    CancelMaker cm;
+    ReentrantMatchingEngine<CancelMaker> e1(1, 10000, cm);
+    cm.e = &e1;
+    cm.maker = e1.submit_limit(Side::Sell, 100, 10);  // rests
+    e1.submit_limit(Side::Buy, 100, 4);               // partial fill -> cancel 6 remaining
+    CHECK(cm.cancels_ok == 1);
+    CHECK(e1.open_orders() == 0 && !e1.has_ask() && !e1.has_bid());
+
+    // 3. Re-entrant submit: a handler that places a new order from inside
+    //    on_trade -- it matches the consistent post-op book and rests.
+    struct Refill {
+        ReentrantMatchingEngine<Refill>* e = nullptr;
+        bool armed = false;
+        int refills = 0;
+        void on_accept(OrderId, Side, Price, Qty) {}
+        void on_trade(const Trade&) {
+            if (armed) { armed = false; e->submit_limit(Side::Sell, 101, 5); ++refills; }
+        }
+        void on_cancel(OrderId) {}
+        void on_reject(OrderId) {}
+    };
+    Refill rf;
+    ReentrantMatchingEngine<Refill> e2(1, 10000, rf);
+    rf.e = &e2; rf.armed = true;
+    e2.submit_limit(Side::Sell, 100, 5);
+    e2.submit_limit(Side::Buy, 100, 5);               // fills -> re-entrant rest at 101
+    CHECK(rf.refills == 1);
+    CHECK(e2.has_ask() && e2.best_ask() == 101 && e2.open_orders() == 1);
+
+    // 4. Exception safety: a handler that throws mid-drain must not leave
+    //    stale buffered events to be re-delivered on the next operation.
+    struct ThrowOnce {
+        bool armed = true;
+        std::vector<char> tape;
+        void on_accept(OrderId, Side, Price, Qty) {
+            tape.push_back('A');
+            if (armed) { armed = false; throw std::runtime_error("boom"); }
+        }
+        void on_trade(const Trade&) { tape.push_back('T'); }
+        void on_cancel(OrderId) { tape.push_back('C'); }
+        void on_reject(OrderId) { tape.push_back('R'); }
+    };
+    ThrowOnce t;
+    ReentrantMatchingEngine<ThrowOnce> e3(1, 10000, t);
+    bool threw = false;
+    try { e3.submit_limit(Side::Buy, 100, 5); }   // rests, then on_accept throws
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    CHECK(t.tape.size() == 1);                     // one accept dispatched, then threw
+    CHECK(e3.open_orders() == 1);                  // the order still rested
+    t.tape.clear();
+    // The next op must deliver only its own events (accept + trade), with no
+    // stale replay of the first order's buffered accept.
+    e3.submit_limit(Side::Sell, 100, 5);
+    CHECK(t.tape.size() == 2);                     // exactly A,T -- not 3 with a stale A
+    CHECK(e3.open_orders() == 0);
 }
 
 static void test_rl_quoter() {
@@ -444,6 +567,7 @@ int main() {
     test_spsc_ring();
     test_mold_udp64();
     test_stress_invariants();
+    test_reentrant_engine();
     test_rl_quoter();
 
     if (g_failures == 0) {

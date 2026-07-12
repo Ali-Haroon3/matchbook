@@ -28,12 +28,21 @@
 //     cancel-replace and goes to the back of the queue, re-matching on
 //     entry. This mirrors real exchange semantics (e.g. Nasdaq).
 //
-// Re-entrancy: the engine is single-threaded and NOT re-entrant. A Handler
-// callback fires mid-mutation and must not call back into submit_*/cancel/
-// modify/reduce (a debug-build assert enforces this).
+// Event delivery (DeferEvents policy):
+//   * false (default): the handler is called directly, mid-mutation, with
+//     zero buffering -- the fast path. The engine is then NOT re-entrant: a
+//     callback must not call back into submit_*/cancel/modify/reduce (a
+//     debug-build assert enforces this).
+//   * true (alias ReentrantMatchingEngine): events are buffered during the
+//     operation and dispatched only after it completes, so callbacks run
+//     against a fully consistent book and may freely re-enter the engine.
+//     Costs one buffer push/pop per event, hence opt-in. Event order and
+//     the "delivered before the call returns" timing are identical to the
+//     default; only the safe re-entrancy and consistent-book view differ.
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "level_bitmap.hpp"
@@ -51,7 +60,7 @@ struct Order {
     Order*  next;
 };
 
-template <typename Handler = NullHandler>
+template <typename Handler = NullHandler, bool DeferEvents = false>
 class MatchingEngine {
 public:
     // Book covers prices in [min_price, max_price], inclusive, in ticks.
@@ -77,82 +86,28 @@ public:
     // on_cancel with no trades).
     OrderId submit_limit(Side side, Price price, Qty qty,
                          TimeInForce tif = TimeInForce::GTC) {
-        CallGuard guard(in_call_);
-        if (!in_band(price) || qty == 0) [[unlikely]] {
-            h_.on_reject(kInvalidOrderId);
-            return kInvalidOrderId;
-        }
-        OrderId id = next_id();
-        h_.on_accept(id, side, price, qty);
-        if (tif == TimeInForce::FOK && fillable(side, price, qty) < qty) {
-            h_.on_cancel(id);
-            return id;
-        }
-        place_limit(id, side, price, qty, tif);
-        return id;
+        return run([&] { return do_submit_limit(side, price, qty, tif); });
     }
 
     // Returns unfilled quantity (0 if fully filled).
     Qty submit_market(Side side, Qty qty) {
-        CallGuard guard(in_call_);
-        OrderId id = next_id();
-        h_.on_accept(id, side, 0, qty);
-        Qty remaining = (side == Side::Buy)
-            ? match_buy(id, qty, static_cast<int64_t>(n_levels_) - 1)
-            : match_sell(id, qty, 0);
-        return remaining;
+        return run([&] { return do_submit_market(side, qty); });
     }
 
     bool cancel(OrderId id) {
-        CallGuard guard(in_call_);
-        return cancel_impl(id);
+        return run([&] { return cancel_impl(id); });
     }
 
     // Reduce a resting order's quantity by `delta` (feed-driven partial
     // execution or partial cancel). Keeps time priority; removes the order
     // if it reduces to zero. Returns false if the order is unknown.
     bool reduce(OrderId id, Qty delta) {
-        CallGuard guard(in_call_);
-        Order* o = lookup(id);
-        if (!o) return false;
-        if (delta >= o->qty) {
-            remove_resting(o);
-            orders_[id] = nullptr;
-            pool_.free(o);
-            return true;
-        }
-        level_of(o).total -= delta;
-        o->qty -= delta;
-        return true;
+        return run([&] { return do_reduce(id, delta); });
     }
 
     // See semantics note at top of file.
     bool modify(OrderId id, Price new_price, Qty new_qty) {
-        CallGuard guard(in_call_);
-        Order* o = lookup(id);
-        if (!o) return false;
-        if (new_qty == 0) return cancel_impl(id);
-        if (!in_band(new_price)) return false;
-
-        if (new_price == o->price && new_qty <= o->qty) {
-            // In-place amend down: keeps time priority.
-            Qty delta = o->qty - new_qty;
-            level_of(o).total -= delta;
-            o->qty = new_qty;
-            return true;
-        }
-        // Cancel-replace: loses priority, may match on re-entry. Emit the
-        // cancel/accept pair so the event stream reflects the semantics --
-        // the old resting order is gone and a new one (same id) is accepted,
-        // mirroring submit_limit, which fires on_accept before it matches.
-        Side side = o->side;
-        remove_resting(o);
-        orders_[id] = nullptr;
-        pool_.free(o);
-        h_.on_cancel(id);
-        h_.on_accept(id, side, new_price, new_qty);
-        place_limit(id, side, new_price, new_qty);
-        return true;
+        return run([&] { return do_modify(id, new_price, new_qty); });
     }
 
     // --- market data -----------------------------------------------------
@@ -177,41 +132,208 @@ private:
         Order* tail  = nullptr;
     };
 
-    // The engine is single-threaded and NOT re-entrant. Handler callbacks
-    // (on_trade/on_accept/on_cancel/on_reject) fire mid-mutation, while book
-    // pointers are being rewired and a node the matcher still holds may be
-    // live, so a callback must not call back into any submit_*/cancel/modify/
-    // reduce method -- doing so is undefined behavior (e.g. cancelling the
-    // order currently being swept frees the node sweep_level dereferences
-    // next). This RAII guard turns a violation into an assert under debug/
-    // ASAN builds and compiles to nothing in release.
-#ifndef NDEBUG
-    struct CallGuard {
-        bool* flag;
-        explicit CallGuard(bool& f) : flag(&f) {
-            assert(!f && "MatchingEngine is not re-entrant: a Handler "
-                         "callback must not call back into the engine");
-            f = true;
-        }
-        ~CallGuard() { *flag = false; }
-        CallGuard(const CallGuard&) = delete;
-        CallGuard& operator=(const CallGuard&) = delete;
-    };
-#else
-    struct CallGuard { explicit CallGuard(bool&) noexcept {} };
-#endif
+    // --- event delivery --------------------------------------------------
 
-    // Shared cancel body, callable from modify() without tripping the
-    // re-entrancy guard the public cancel() holds.
+    // A buffered handler event (only materialized when DeferEvents).
+    struct Event {
+        enum class Kind : uint8_t { Accept, Trade, Cancel, Reject };
+        Kind    kind;
+        Trade   trade{};        // Trade
+        OrderId id    = 0;      // Accept/Cancel/Reject
+        Side    side  = Side::Buy;  // Accept
+        Price   price = 0;      // Accept
+        Qty     qty   = 0;      // Accept
+    };
+
+    void emit_accept(OrderId id, Side s, Price p, Qty q) {
+        if constexpr (DeferEvents) {
+            Event e; e.kind = Event::Kind::Accept;
+            e.id = id; e.side = s; e.price = p; e.qty = q;
+            queue_.push_back(e);
+        } else {
+            h_.on_accept(id, s, p, q);
+        }
+    }
+    void emit_trade(const Trade& t) {
+        if constexpr (DeferEvents) {
+            Event e; e.kind = Event::Kind::Trade; e.trade = t;
+            queue_.push_back(e);
+        } else {
+            h_.on_trade(t);
+        }
+    }
+    void emit_cancel(OrderId id) {
+        if constexpr (DeferEvents) {
+            Event e; e.kind = Event::Kind::Cancel; e.id = id;
+            queue_.push_back(e);
+        } else {
+            h_.on_cancel(id);
+        }
+    }
+    void emit_reject(OrderId id) {
+        if constexpr (DeferEvents) {
+            Event e; e.kind = Event::Kind::Reject; e.id = id;
+            queue_.push_back(e);
+        } else {
+            h_.on_reject(id);
+        }
+    }
+
+    void dispatch(const Event& e) {
+        switch (e.kind) {
+            case Event::Kind::Accept: h_.on_accept(e.id, e.side, e.price, e.qty); break;
+            case Event::Kind::Trade:  h_.on_trade(e.trade); break;
+            case Event::Kind::Cancel: h_.on_cancel(e.id); break;
+            case Event::Kind::Reject: h_.on_reject(e.id); break;
+        }
+    }
+
+    // Drain buffered events after the outermost operation. A handler may
+    // re-enter the engine here: the re-entrant call mutates the (now
+    // consistent) book and appends its own events, which this same loop
+    // then delivers in FIFO order. Each event is copied out before
+    // dispatch, since a re-entrant append may reallocate the buffer.
+    //
+    // The buffer is emptied by the outermost Session's destructor, not here,
+    // so it is cleared whether drain() returns normally or a handler throws
+    // mid-dispatch. A throwing handler therefore aborts the rest of the
+    // batch (those events are dropped, the throw propagates) but cannot
+    // leave stale events to be re-delivered on the next call.
+    void drain() {
+        for (size_t i = 0; i < queue_.size(); ++i) {
+            Event e = queue_[i];
+            dispatch(e);
+        }
+    }
+
+    // RAII scope wrapping every public entry point. Default mode: a
+    // debug-only re-entrancy assert (nothing in release). Deferred mode:
+    // tracks nesting depth so only the outermost call drains.
+    struct Session {
+        [[maybe_unused]] MatchingEngine& e;
+        explicit Session([[maybe_unused]] MatchingEngine& eng) : e(eng) {
+            if constexpr (DeferEvents) {
+                ++e.depth_;
+            }
+#ifndef NDEBUG
+            else {
+                assert(e.depth_ == 0 &&
+                       "MatchingEngine is not re-entrant in the default mode; "
+                       "use ReentrantMatchingEngine to call back into the "
+                       "engine from a Handler callback");
+                e.depth_ = 1;
+            }
+#endif
+        }
+        ~Session() {
+            if constexpr (DeferEvents) {
+                // Emptying the buffer as the outermost call unwinds (not in
+                // drain()) keeps it clean even if a handler threw mid-drain.
+                if (--e.depth_ == 0) e.queue_.clear();
+            }
+#ifndef NDEBUG
+            else {
+                e.depth_ = 0;
+            }
+#endif
+        }
+        Session(const Session&) = delete;
+        Session& operator=(const Session&) = delete;
+        bool outermost() const noexcept { return e.depth_ == 1; }
+    };
+
+    // Run one public operation under a Session, then (deferred mode only)
+    // dispatch its events once the outermost call unwinds. In the default
+    // mode this inlines to the operation body plus, in debug, the guard.
+    template <typename F>
+    auto run(F&& f) {
+        Session s(*this);
+        auto result = f();
+        if constexpr (DeferEvents) {
+            if (s.outermost()) drain();
+        }
+        return result;
+    }
+
+    // --- operations ------------------------------------------------------
+
+    OrderId do_submit_limit(Side side, Price price, Qty qty, TimeInForce tif) {
+        if (!in_band(price) || qty == 0) [[unlikely]] {
+            emit_reject(kInvalidOrderId);
+            return kInvalidOrderId;
+        }
+        OrderId id = next_id();
+        emit_accept(id, side, price, qty);
+        if (tif == TimeInForce::FOK && fillable(side, price, qty) < qty) {
+            emit_cancel(id);
+            return id;
+        }
+        place_limit(id, side, price, qty, tif);
+        return id;
+    }
+
+    Qty do_submit_market(Side side, Qty qty) {
+        OrderId id = next_id();
+        emit_accept(id, side, 0, qty);
+        return (side == Side::Buy)
+            ? match_buy(id, qty, static_cast<int64_t>(n_levels_) - 1)
+            : match_sell(id, qty, 0);
+    }
+
+    // Shared cancel body; also called from do_modify() so the re-entrancy
+    // guard / drain is owned by exactly one Session per public call.
     bool cancel_impl(OrderId id) {
         Order* o = lookup(id);
         if (!o) return false;
         remove_resting(o);
         orders_[id] = nullptr;
         pool_.free(o);
-        h_.on_cancel(id);
+        emit_cancel(id);
         return true;
     }
+
+    bool do_reduce(OrderId id, Qty delta) {
+        Order* o = lookup(id);
+        if (!o) return false;
+        if (delta >= o->qty) {
+            remove_resting(o);
+            orders_[id] = nullptr;
+            pool_.free(o);
+            return true;
+        }
+        level_of(o).total -= delta;
+        o->qty -= delta;
+        return true;
+    }
+
+    bool do_modify(OrderId id, Price new_price, Qty new_qty) {
+        Order* o = lookup(id);
+        if (!o) return false;
+        if (new_qty == 0) return cancel_impl(id);
+        if (!in_band(new_price)) return false;
+
+        if (new_price == o->price && new_qty <= o->qty) {
+            // In-place amend down: keeps time priority.
+            Qty delta = o->qty - new_qty;
+            level_of(o).total -= delta;
+            o->qty = new_qty;
+            return true;
+        }
+        // Cancel-replace: loses priority, may match on re-entry. Emit the
+        // cancel/accept pair so the event stream reflects the semantics --
+        // the old resting order is gone and a new one (same id) is accepted,
+        // mirroring submit_limit, which fires on_accept before it matches.
+        Side side = o->side;
+        remove_resting(o);
+        orders_[id] = nullptr;
+        pool_.free(o);
+        emit_cancel(id);
+        emit_accept(id, side, new_price, new_qty);
+        place_limit(id, side, new_price, new_qty);
+        return true;
+    }
+
+    // --- internals -------------------------------------------------------
 
     bool in_band(Price p) const noexcept {
         return p >= min_ && p < min_ + static_cast<Price>(n_levels_);
@@ -242,7 +364,7 @@ private:
             : match_sell(id, qty, limit_idx);
         if (remaining > 0) {
             if (tif == TimeInForce::GTC) rest(id, side, price, remaining);
-            else                         h_.on_cancel(id);
+            else                         emit_cancel(id);
         }
     }
 
@@ -298,7 +420,7 @@ private:
             o->qty    -= fill;
             lvl.total -= fill;
             qty       -= fill;
-            h_.on_trade(Trade{taker, o->id, px, fill, taker_side});
+            emit_trade(Trade{taker, o->id, px, fill, taker_side});
             if (o->qty == 0) {
                 Order* next = o->next;
                 orders_[o->id] = nullptr;
@@ -369,7 +491,13 @@ private:
     Pool<Order> pool_;
     std::vector<Order*> orders_;  // id -> node (nullptr if gone/never rested)
     Handler& h_;
-    bool in_call_ = false;        // re-entrancy guard flag (see CallGuard)
+    std::vector<Event> queue_;    // deferred-mode event buffer (unused if !DeferEvents)
+    int depth_ = 0;               // re-entrancy nesting depth (see Session)
 };
+
+// Fully re-entrant variant: Handler callbacks run after each operation
+// completes, against a consistent book, and may call back into the engine.
+template <typename Handler = NullHandler>
+using ReentrantMatchingEngine = MatchingEngine<Handler, true>;
 
 }  // namespace matchbook

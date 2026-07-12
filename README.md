@@ -75,6 +75,19 @@ modify are one indirection.
 `Handler` (accept/trade/cancel/reject callbacks). No virtual dispatch, no
 `std::function`, and a no-op handler compiles to nothing.
 
+**Two event-delivery modes, chosen at compile time.** By default the
+handler is called directly, mid-match, with zero buffering — the fast
+path. In that mode the engine is not re-entrant: a callback must not call
+back into `submit_*`/`cancel`/`modify`/`reduce` (it would free the node
+the matcher is holding), and a debug-build assert enforces it.
+`ReentrantMatchingEngine<Handler>` (an alias for the same engine with
+`DeferEvents = true`) instead buffers events during an operation and
+dispatches them only once it completes, so callbacks run against a fully
+consistent book and may freely re-enter — a strategy can place an order
+straight from inside `on_trade`. Events arrive in the same order and still
+before the call returns; the only cost is one buffer push/pop per event,
+which is why it is opt-in and the default stays allocation-free.
+
 **Lock-free SPSC ring between feed and matching threads.** Single
 producer, single consumer, cache-line-padded head/tail with each side
 caching the other's index, so the common case is one relaxed load and one
@@ -214,12 +227,13 @@ cancel-replace event pair, modifies that cross the book, IOC/FOK
 time-in-force, band rejection, a rejected feed replace keeping its order
 reachable, the bitmap, MoldUDP64 framing (round trip, control packets,
 malformed input, gap tracking), the ring, and the Q-learning quoter
-(bucketing bounds, update math, uncrossed quotes), plus a 200k-op
-randomized fuzz (limits, cancels,
-markets,
-IOC/FOK) that asserts book invariants (never locked or crossed,
-consistent open-order accounting) after every operation. CI runs the
-suite in Release and under ASAN + UBSAN.
+(bucketing bounds, update math, uncrossed quotes), and the re-entrant
+engine (event-tape parity with the default mode, a handler that cancels
+the maker from inside on_trade, a handler that re-submits from a fill),
+plus a 200k-op randomized fuzz (limits, cancels, markets, IOC/FOK) — run
+against both the default and deferred-event engines — that asserts book
+invariants (never locked or crossed, consistent open-order accounting)
+after every operation. CI runs the suite in Release and under ASAN + UBSAN.
 
 ## Roadmap
 
