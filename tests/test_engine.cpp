@@ -11,6 +11,7 @@
 #include "matchbook/itch_book_builder.hpp"
 #include "matchbook/matching_engine.hpp"
 #include "matchbook/mold_udp64.hpp"
+#include "matchbook/ouch.hpp"
 #include "matchbook/spsc_ring.hpp"
 #include "matchbook/level_bitmap.hpp"
 #include "matchbook/strategy/rl_quoter.hpp"
@@ -962,6 +963,251 @@ static void test_mold_udp64() {
     CHECK(t.expected() == 11);
 }
 
+// Space-pad a token the way it appears on the wire.
+static std::string tok(const char* s) {
+    std::string t(s);
+    t.resize(ouch::kTokenLen, ' ');
+    return t;
+}
+
+static std::vector<ouch::OutMsg> ouch_drain(ouch::Gateway& gw) {
+    std::vector<ouch::OutMsg> v;
+    for (auto& m : gw.take_out()) {
+        ouch::OutMsg om{};
+        CHECK(ouch::decode_out(m.data(), m.size(), om));
+        v.push_back(om);
+    }
+    return v;
+}
+
+static void ouch_enter(ouch::Gateway& gw, const char* token, Side side,
+                       uint32_t qty, Price px,
+                       TimeInForce tif = TimeInForce::GTC,
+                       uint32_t display = 0, OwnerId owner = 0,
+                       StpPolicy stp = StpPolicy::CancelTaker) {
+    std::vector<uint8_t> b;
+    ouch::encode_enter(b, token, side, qty, px, tif, display, owner, stp);
+    CHECK(gw.on_message(b.data(), b.size()));
+}
+
+static void test_ouch_codec() {
+    // Inbound round trip, token space-padding included.
+    std::vector<uint8_t> b;
+    ouch::encode_enter(b, "ABC", Side::Buy, 50, -3, TimeInForce::PostOnly,
+                       7, 42, StpPolicy::CancelBoth);
+    CHECK(b.size() == ouch::kEnterSize);
+    ouch::InMsg in{};
+    CHECK(ouch::decode_in(b.data(), b.size(), in));
+    CHECK(in.type == ouch::InType::Enter);
+    CHECK(tok("ABC") == in.token);
+    CHECK(in.side == Side::Buy && in.qty == 50);
+    CHECK(in.price == -3);                       // negative survives (i64)
+    CHECK(in.tif == TimeInForce::PostOnly && in.display == 7);
+    CHECK(in.owner == 42 && in.stp == StpPolicy::CancelBoth);
+    CHECK(!ouch::decode_in(b.data(), b.size() - 1, in));   // truncated
+    b[28] = 9;                                             // bad tif byte
+    CHECK(!ouch::decode_in(b.data(), b.size(), in));
+
+    b.clear();
+    ouch::encode_replace(b, "OLD", "NEW", 9, 123);
+    CHECK(b.size() == ouch::kReplaceSize);
+    CHECK(ouch::decode_in(b.data(), b.size(), in));
+    CHECK(in.type == ouch::InType::Replace);
+    CHECK(tok("OLD") == in.token && tok("NEW") == in.new_token);
+    CHECK(in.qty == 9 && in.price == 123);
+
+    b.clear();
+    ouch::encode_cancel(b, "OLD");
+    CHECK(ouch::decode_in(b.data(), b.size(), in));
+    CHECK(in.type == ouch::InType::Cancel && tok("OLD") == in.token);
+    b[0] = 'Z';
+    CHECK(!ouch::decode_in(b.data(), b.size(), in));       // unknown type
+
+    // Outbound round trips.
+    ouch::OutMsg om{};
+    b.clear();
+    ouch::encode_accepted(b, "T1", 55, Side::Sell, 10, 999);
+    CHECK(b.size() == ouch::kAcceptedSize);
+    CHECK(ouch::decode_out(b.data(), b.size(), om));
+    CHECK(om.type == ouch::OutType::Accepted && tok("T1") == om.token);
+    CHECK(om.id == 55 && om.side == Side::Sell && om.qty == 10 &&
+          om.price == 999);
+    b.clear();
+    ouch::encode_executed(b, "T1", 4, 998, 77);
+    CHECK(ouch::decode_out(b.data(), b.size(), om));
+    CHECK(om.type == ouch::OutType::Executed && om.qty == 4 &&
+          om.price == 998 && om.match == 77);
+    b.clear();
+    ouch::encode_canceled(b, "T1", ouch::kUserRequested);
+    CHECK(ouch::decode_out(b.data(), b.size(), om));
+    CHECK(om.type == ouch::OutType::Canceled && om.reason == 'U');
+    b.clear();
+    ouch::encode_replaced(b, "T1", "T2", 55, 6, 997);
+    CHECK(b.size() == ouch::kReplacedSize);
+    CHECK(ouch::decode_out(b.data(), b.size(), om));
+    CHECK(om.type == ouch::OutType::Replaced);
+    CHECK(tok("T1") == om.token && tok("T2") == om.new_token);
+    CHECK(om.id == 55 && om.qty == 6 && om.price == 997);
+    b.clear();
+    ouch::encode_rejected(b, "T3", ouch::kBadToken);
+    CHECK(ouch::decode_out(b.data(), b.size(), om));
+    CHECK(om.type == ouch::OutType::Rejected && om.reason == 'T');
+    CHECK(!ouch::decode_out(b.data(), 3, om));             // truncated
+}
+
+static void test_ouch_gateway() {
+    using ouch::OutType;
+    // Accept, cross, both Executed under one match number, remainder rests.
+    {
+        ouch::Gateway gw(1, 10000);
+        ouch_enter(gw, "SELL1", Side::Sell, 5, 100);
+        auto v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Accepted);
+        CHECK(tok("SELL1") == v[0].token && v[0].qty == 5 && v[0].price == 100);
+
+        ouch_enter(gw, "BUY1", Side::Buy, 8, 100);
+        v = ouch_drain(gw);
+        CHECK(v.size() == 3);
+        CHECK(v[0].type == OutType::Accepted && tok("BUY1") == v[0].token);
+        CHECK(v[1].type == OutType::Executed && tok("BUY1") == v[1].token);
+        CHECK(v[2].type == OutType::Executed && tok("SELL1") == v[2].token);
+        CHECK(v[1].qty == 5 && v[2].qty == 5 && v[1].price == 100);
+        CHECK(v[1].match == v[2].match && v[1].match > 0);
+        CHECK(gw.engine().depth_at(Side::Buy, 100) == 3);
+
+        // User cancel; second cancel and token reuse are both dead-token
+        // rejects.
+        std::vector<uint8_t> b;
+        ouch::encode_cancel(b, "BUY1");
+        CHECK(gw.on_message(b.data(), b.size()));
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Canceled);
+        CHECK(v[0].reason == ouch::kUserRequested);
+        CHECK(gw.on_message(b.data(), b.size()));
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+        CHECK(v[0].reason == ouch::kBadToken);
+        ouch_enter(gw, "SELL1", Side::Sell, 1, 101);       // reuse: burned
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+        CHECK(v[0].reason == ouch::kBadToken);
+    }
+    // IOC kill and validation rejects (token not burned by a reject).
+    {
+        ouch::Gateway gw(1, 10000);
+        ouch_enter(gw, "S", Side::Sell, 4, 100);
+        ouch_drain(gw);
+        ouch_enter(gw, "B", Side::Buy, 9, 100, TimeInForce::IOC);
+        auto v = ouch_drain(gw);
+        CHECK(v.size() == 4);
+        CHECK(v[0].type == OutType::Accepted);
+        CHECK(v[1].type == OutType::Executed && v[2].type == OutType::Executed);
+        CHECK(v[3].type == OutType::Canceled && tok("B") == v[3].token);
+        CHECK(v[3].reason == ouch::kKilledOnEntry);
+
+        ouch_enter(gw, "V", Side::Buy, 0, 100);            // qty 0
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+        CHECK(v[0].reason == ouch::kValidation);
+        ouch_enter(gw, "V", Side::Buy, 5, 999999);         // out of band
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].reason == ouch::kValidation);
+        ouch_enter(gw, "V", Side::Buy, 5, 99);             // now fine
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Accepted);
+    }
+    // Replace: ack precedes re-entry executions; old token dies; failed
+    // replace leaves the original untouched under the old token.
+    {
+        ouch::Gateway gw(1, 10000);
+        ouch_enter(gw, "BUY5", Side::Buy, 6, 95);
+        ouch_enter(gw, "SELL3", Side::Sell, 10, 105);
+        ouch_drain(gw);
+
+        std::vector<uint8_t> b;
+        ouch::encode_replace(b, "SELL3", "SELL4", 6, 105); // amend down
+        CHECK(gw.on_message(b.data(), b.size()));
+        auto v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Replaced);
+        CHECK(tok("SELL3") == v[0].token && tok("SELL4") == v[0].new_token);
+        CHECK(gw.engine().depth_at(Side::Sell, 105) == 6);
+
+        b.clear();
+        ouch::encode_cancel(b, "SELL3");                   // old token dead
+        gw.on_message(b.data(), b.size());
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+
+        b.clear();
+        ouch::encode_replace(b, "SELL4", "SELL5", 6, 999999);  // bad price
+        gw.on_message(b.data(), b.size());
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+        CHECK(v[0].reason == ouch::kValidation);
+        CHECK(gw.engine().depth_at(Side::Sell, 105) == 6); // untouched
+
+        b.clear();
+        ouch::encode_replace(b, "SELL4", "SELL5", 6, 95);  // crosses BUY5
+        gw.on_message(b.data(), b.size());
+        v = ouch_drain(gw);
+        CHECK(v.size() == 3);
+        CHECK(v[0].type == OutType::Replaced);             // ack first...
+        CHECK(v[1].type == OutType::Executed);             // ...then fills
+        CHECK(tok("SELL5") == v[1].token || tok("SELL5") == v[2].token);
+        CHECK(v[1].price == 95 && v[1].qty == 6);
+        CHECK(gw.engine().open_orders() == 0);
+
+        b.clear();
+        ouch::encode_replace(b, "NOPE", "NEW1", 1, 100);   // unknown token
+        gw.on_message(b.data(), b.size());
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+        CHECK(tok("NEW1") == v[0].token && v[0].reason == ouch::kBadToken);
+    }
+    // Self-trade prevention over the wire, both directions of yield.
+    {
+        ouch::Gateway gw(1, 10000);
+        ouch_enter(gw, "MINE", Side::Sell, 5, 100, TimeInForce::GTC, 0, 7);
+        ouch_drain(gw);
+        ouch_enter(gw, "TAKE", Side::Buy, 5, 100, TimeInForce::GTC, 0, 7);
+        auto v = ouch_drain(gw);
+        CHECK(v.size() == 2);
+        CHECK(v[0].type == OutType::Accepted);
+        CHECK(v[1].type == OutType::Canceled && tok("TAKE") == v[1].token);
+        CHECK(v[1].reason == ouch::kKilledOnEntry);
+
+        ouch_enter(gw, "WIPE", Side::Buy, 5, 100, TimeInForce::GTC, 0, 7,
+                   StpPolicy::CancelMaker);
+        v = ouch_drain(gw);
+        CHECK(v.size() == 2);
+        CHECK(v[0].type == OutType::Accepted);
+        CHECK(v[1].type == OutType::Canceled && tok("MINE") == v[1].token);
+        CHECK(v[1].reason == ouch::kSelfTrade);
+        CHECK(gw.engine().depth_at(Side::Buy, 100) == 5);  // WIPE rested
+    }
+    // Iceberg display over the wire; outbound frames straight into Mold.
+    {
+        ouch::Gateway gw(1, 10000);
+        ouch_enter(gw, "ICE", Side::Sell, 25, 100, TimeInForce::GTC, 10);
+        CHECK(gw.engine().depth_at(Side::Sell, 100) == 10);
+        CHECK(gw.engine().hidden_at(Side::Sell, 100) == 15);
+
+        auto msgs = gw.take_out();
+        CHECK(msgs.size() == 1);
+        std::vector<uint8_t> pkt;
+        mold::encode("OUCH", 1, msgs, pkt);
+        mold::Header hdr;
+        int64_t n = mold::decode(pkt.data(), pkt.size(), hdr,
+                                 [&](uint64_t, const uint8_t* p, size_t len) {
+            ouch::OutMsg om{};
+            CHECK(ouch::decode_out(p, len, om));
+            CHECK(om.type == OutType::Accepted && tok("ICE") == om.token);
+            CHECK(om.qty == 25);                           // full size to owner
+        });
+        CHECK(n == 1);
+    }
+}
+
 template <typename Eng>
 static void stress_invariants(uint64_t seed) {
     // Randomized fuzz over the full order-type zoo (plain limits with
@@ -1294,6 +1540,8 @@ int main() {
     test_bitmap();
     test_spsc_ring();
     test_mold_udp64();
+    test_ouch_codec();
+    test_ouch_gateway();
     test_stress_invariants();
     test_reentrant_engine();
     test_rl_quoter();

@@ -234,6 +234,29 @@ address argument selects the NIC, as production multicast feeds do;
 bit-identical to the file replay's. A receiver that misses the
 end-of-session packet exits after 5s of feed silence instead of hanging.
 
+## Order entry (OUCH-style)
+
+`ouch.hpp` is the client-facing counterpart to the ITCH side: an
+OUCH 4.2-shaped binary order-entry protocol (fixed-width big-endian
+fields, one-letter types, 14-byte space-padded client tokens that are
+single-use for the session) plus a session `Gateway` that wires the
+message stream to an engine. Enter/Replace/Cancel go in;
+Accepted/Executed/Canceled/Replaced/Rejected come out, one byte vector
+per message — exactly the shape `mold::encode` takes, so gating OUCH
+responses onto a MoldUDP64 wire is one call.
+
+The gateway enforces the protocol's session rules rather than leaving
+them to the engine: token reuse (including a replaced-away or dead
+token) is rejected, a replace binds its new token before re-entry so
+fills print under it — with the Replaced ack inserted ahead of them in
+the outbound stream — and cancels carry a reason (user-requested,
+killed-on-entry for IOC/FOK/post-only/STP kills, self-trade for STP
+removals of resting orders). Both sides of a fill get an Executed with
+a shared match number. Deviations from Nasdaq's spec are deliberate and
+documented in the header: 8-byte signed tick prices, the engine's TIF
+enum, and Enter carrying display/owner/STP so icebergs and self-trade
+prevention are reachable over the wire.
+
 ## Market-making layer
 
 `strategy/avellaneda_stoikov.hpp` implements the closed-form
@@ -286,7 +309,10 @@ auctions (call-phase accumulation, the equilibrium tie-break ladder,
 iceberg participation, stops arming off the opening print, unbalanced
 crosses), the depth snapshot, band rejection, a rejected feed replace
 keeping its order reachable, the bitmap, MoldUDP64 framing (round trip,
-control packets, malformed input, gap tracking), the ring, and the
+control packets, malformed input, gap tracking), the OUCH codec and
+gateway (round trips, token lifecycle, replace-ack ordering ahead of
+re-entry fills, cancel reasons, STP and icebergs over the wire, framing
+outbound into Mold), the ring, and the
 Q-learning quoter (bucketing bounds, update math, uncrossed quotes), and
 the re-entrant engine (event-tape parity with the default mode, a handler
 that cancels the maker from inside on_trade, a handler that re-submits
@@ -308,6 +334,7 @@ Release and under ASAN + UBSAN.
 - ~~Stop and stop-limit orders with cascading triggers~~ done: `submit_stop`, `submit_stop_limit`
 - ~~Call auctions: halt / equilibrium-price uncross / resume~~ done: `halt()`, `uncross()`, `resume()`
 - ~~L2 depth snapshots with per-level order counts~~ done: `top_levels()`, `visit_levels()`
+- ~~OUCH-style binary order entry with a token-tracking session gateway~~ done: `ouch.hpp`
 
 ## License
 
