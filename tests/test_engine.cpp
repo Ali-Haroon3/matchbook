@@ -301,6 +301,53 @@ static void test_band_rejection() {
     CHECK(e.submit_limit(Side::Sell, 200, 5) != kInvalidOrderId);
 }
 
+static void test_depth_snapshot() {
+    Recorder r;
+    Engine e(1, 10000, r);
+
+    // Empty book: empty snapshot, zero counts.
+    CHECK(e.top_levels(Side::Buy, 5).empty());
+    CHECK(e.order_count_at(Side::Buy, 100) == 0);
+    CHECK(e.order_count_at(Side::Buy, 999999) == 0);   // out of band
+
+    e.submit_limit(Side::Buy, 100, 5);
+    e.submit_limit(Side::Buy, 100, 7);
+    e.submit_limit(Side::Buy, 98, 3);
+    OrderId b96 = e.submit_limit(Side::Buy, 96, 9);
+    e.submit_limit(Side::Sell, 105, 4);
+    e.submit_limit(Side::Sell, 106, 6);
+
+    // Bids best-first (descending), aggregated qty and per-level counts.
+    auto bids = e.top_levels(Side::Buy, 10);
+    CHECK(bids.size() == 3);
+    CHECK(bids[0].price == 100 && bids[0].qty == 12 && bids[0].orders == 2);
+    CHECK(bids[1].price == 98  && bids[1].qty == 3  && bids[1].orders == 1);
+    CHECK(bids[2].price == 96  && bids[2].qty == 9  && bids[2].orders == 1);
+
+    // Asks best-first (ascending); truncation honors max_levels.
+    auto asks = e.top_levels(Side::Sell, 1);
+    CHECK(asks.size() == 1);
+    CHECK(asks[0].price == 105 && asks[0].qty == 4 && asks[0].orders == 1);
+
+    // Counts stay consistent through fills and cancels.
+    e.submit_limit(Side::Sell, 100, 4);                  // partial fill of first
+    CHECK(e.order_count_at(Side::Buy, 100) == 2);        // both still resting
+    e.submit_limit(Side::Sell, 100, 8);                  // finishes the level
+    CHECK(e.order_count_at(Side::Buy, 100) == 0);
+    CHECK(e.cancel(b96));
+    CHECK(e.order_count_at(Side::Buy, 96) == 0);
+    auto after = e.top_levels(Side::Buy, 10);
+    CHECK(after.size() == 1 && after[0].price == 98);
+
+    // visit_levels is the zero-alloc primitive under top_levels.
+    size_t seen = 0;
+    e.visit_levels(Side::Sell, 100, [&](const LevelView& v) {
+        ++seen;
+        CHECK(v.orders == 1);
+    });
+    CHECK(seen == 2);
+}
+
 static void test_bitmap() {
     LevelBitmap m(300);
     CHECK(m.find_le(299) == -1);
@@ -596,6 +643,7 @@ int main() {
     test_fok();
     test_post_only();
     test_band_rejection();
+    test_depth_snapshot();
     test_bitmap();
     test_spsc_ring();
     test_mold_udp64();

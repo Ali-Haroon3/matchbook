@@ -61,6 +61,13 @@ struct Order {
     Order*  next;
 };
 
+// One aggregated price level, as reported by top_levels()/visit_levels().
+struct LevelView {
+    Price    price;
+    Qty      qty;     // total resting quantity at the level
+    uint32_t orders;  // number of resting orders at the level
+};
+
 template <typename Handler = NullHandler, bool DeferEvents = false>
 class MatchingEngine {
 public:
@@ -124,13 +131,44 @@ public:
         return levels[idx(price)].total;
     }
 
+    uint32_t order_count_at(Side side, Price price) const noexcept {
+        if (!in_band(price)) return 0;
+        const auto& levels = (side == Side::Buy) ? bids_ : asks_;
+        return levels[idx(price)].count;
+    }
+
+    // Walk up to `max_levels` occupied levels best-first (bids descending,
+    // asks ascending), calling f(LevelView) for each. Zero allocation: the
+    // scan is bitmap hops over occupied levels only.
+    template <typename F>
+    void visit_levels(Side side, size_t max_levels, F&& f) const {
+        const auto& levels = (side == Side::Buy) ? bids_ : asks_;
+        int64_t i = (side == Side::Buy) ? best_bid_ : best_ask_;
+        for (size_t n = 0; i >= 0 && n < max_levels; ++n) {
+            const Level& lvl = levels[static_cast<size_t>(i)];
+            f(LevelView{min_ + i, lvl.total, lvl.count});
+            i = (side == Side::Buy) ? bid_map_.find_le(i - 1)
+                                    : ask_map_.find_ge(i + 1);
+        }
+    }
+
+    // Convenience snapshot of the top of the book (allocates).
+    std::vector<LevelView> top_levels(Side side, size_t max_levels) const {
+        std::vector<LevelView> out;
+        out.reserve(max_levels);
+        visit_levels(side, max_levels,
+                     [&](const LevelView& v) { out.push_back(v); });
+        return out;
+    }
+
     size_t open_orders() const noexcept { return pool_.in_use(); }
 
 private:
     struct Level {
-        Qty    total = 0;
-        Order* head  = nullptr;
-        Order* tail  = nullptr;
+        Qty      total = 0;
+        Order*   head  = nullptr;
+        Order*   tail  = nullptr;
+        uint32_t count = 0;   // resting orders at this level
     };
 
     // --- event delivery --------------------------------------------------
@@ -441,6 +479,7 @@ private:
                 Order* next = o->next;
                 orders_[o->id] = nullptr;
                 pool_.free(o);
+                --lvl.count;
                 o = next;
                 lvl.head = o;
                 if (o) o->prev = nullptr;
@@ -474,6 +513,7 @@ private:
             }
         }
         lvl.total += qty;
+        ++lvl.count;
         orders_[id] = o;
     }
 
@@ -485,6 +525,7 @@ private:
         if (o->prev) o->prev->next = o->next; else lvl.head = o->next;
         if (o->next) o->next->prev = o->prev; else lvl.tail = o->prev;
         lvl.total -= o->qty;
+        --lvl.count;
         if (lvl.head == nullptr) {
             if (o->side == Side::Buy) {
                 bid_map_.clear(i);
