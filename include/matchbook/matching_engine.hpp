@@ -48,6 +48,11 @@
 //     fixpoint, buy stops ascending then sell stops descending, FIFO
 //     within a trigger level). Pending stops are invisible to depth and
 //     best-price, cancellable by id, and refused by modify()/reduce().
+//   * auctions: halt() suspends matching so GTC flow accumulates (the
+//     book may cross); uncross() executes the overlap at one clearing
+//     price -- max volume, then min imbalance, then nearest last trade,
+//     then lowest -- and resume() returns to continuous trading, firing
+//     any stops the auction prints armed. See the method comments.
 //
 // Event delivery (DeferEvents policy):
 //   * false (default): the handler is called directly, mid-mutation, with
@@ -197,6 +202,40 @@ public:
     // See semantics note at top of file.
     bool modify(OrderId id, Price new_price, Qty new_qty) {
         return run([&] { return do_modify(id, new_price, new_qty); });
+    }
+
+    // --- auction (call phase + uncross) ------------------------------------
+
+    // Suspend continuous matching. While halted, GTC limits and icebergs
+    // accumulate without matching (the book may cross), IOC/FOK/PostOnly
+    // are killed on entry (they are continuous-session concepts), market
+    // orders are rejected outright, and stops park without triggering.
+    // cancel/modify/reduce work normally.
+    void halt() {
+        run([&] { halted_ = true; return 0; });
+    }
+
+    // Re-enable continuous matching. Does not uncross by itself: call
+    // uncross() first for an auction, or resume directly and let any
+    // standing overlap trade against new flow. Stops armed by auction
+    // prints fire here, off the opening print, before this returns.
+    void resume() {
+        run([&] { halted_ = false; return 0; });
+    }
+
+    bool is_halted() const noexcept { return halted_; }
+
+    // Cross the overlapped book at one clearing price and return the
+    // executed quantity (0 if the book is not crossed). The price
+    // maximizes executable volume; ties prefer the smallest leftover
+    // imbalance, then the price nearest the last trade, then the lowest.
+    // Fills follow price-time priority on both sides, print taker=buy /
+    // maker=sell at the clearing price, and consume iceberg reserves
+    // directly (hidden quantity participates in full, one print per
+    // matched pair). Intended between halt() and resume(); STP is not
+    // applied (an auction has no aggressor).
+    Qty uncross() {
+        return run([&] { return do_uncross(); });
     }
 
     // --- market data -----------------------------------------------------
@@ -421,6 +460,14 @@ private:
         }
         OrderId id = next_id();
         emit_accept(id, side, price, qty);
+        if (halted_) [[unlikely]] {
+            if (tif != TimeInForce::GTC) {
+                emit_cancel(id);            // no continuous concepts in a call
+                return id;
+            }
+            rest(id, side, price, qty, owner, stp);
+            return id;
+        }
         if (tif == TimeInForce::FOK && fillable(side, price, qty) < qty) {
             emit_cancel(id);
             return id;
@@ -434,6 +481,10 @@ private:
     }
 
     Qty do_submit_market(Side side, Qty qty, OwnerId owner, StpPolicy stp) {
+        if (halted_) [[unlikely]] {
+            emit_reject(kInvalidOrderId);   // no market orders in a call phase
+            return qty;
+        }
         OrderId id = next_id();
         emit_accept(id, side, 0, qty);
         Qty remaining = (side == Side::Buy)
@@ -453,7 +504,7 @@ private:
         }
         OrderId id = next_id();
         emit_accept(id, side, stop_price, qty);
-        if (has_last_ && stop_triggered(side, stop_price, last_px_)) {
+        if (!halted_ && has_last_ && stop_triggered(side, stop_price, last_px_)) {
             // Already through the trigger: fire immediately. No second
             // accept -- the id was announced above; fills reference it.
             execute_stop(id, side, limit_price, qty, is_market, owner, stp);
@@ -473,6 +524,14 @@ private:
         }
         OrderId id = next_id();
         emit_accept(id, side, price, total_qty);
+        if (halted_) [[unlikely]] {
+            if (tif != TimeInForce::GTC) {
+                emit_cancel(id);
+                return id;
+            }
+            rest(id, side, price, total_qty, owner, stp, display);
+            return id;
+        }
         if (tif == TimeInForce::FOK &&
             fillable(side, price, total_qty) < total_qty) {
             emit_cancel(id);
@@ -576,6 +635,120 @@ private:
         return true;
     }
 
+    // --- auction uncross ---------------------------------------------------
+
+    // Consume `f` from the head order of `lvl` (displayed first, then any
+    // iceberg reserve), removing it if fully spent. A part-consumed
+    // iceberg is renormalized to a fresh clip so the post-auction book is
+    // shaped exactly as if the clip had replenished. Returns true if the
+    // level emptied.
+    bool auction_fill(Level& lvl, Order* o, Qty f) {
+        Qty from_disp = (f < o->qty) ? f : o->qty;
+        o->qty    -= from_disp;
+        lvl.total -= from_disp;
+        Qty left = f - from_disp;
+        if (o->flags & kIceberg) {
+            Extra& x = extras_[static_cast<size_t>(o->ext)];
+            x.reserve  -= left;   // left <= reserve by construction
+            lvl.hidden -= left;
+            if (o->qty == 0 && x.reserve > 0) {
+                Qty clip = (x.peak < x.reserve) ? x.peak : x.reserve;
+                x.reserve  -= clip;
+                o->qty      = clip;
+                lvl.total  += clip;
+                lvl.hidden -= clip;
+            }
+        }
+        if (o->qty == 0) {
+            orders_[o->id] = nullptr;
+            release(o);
+            --lvl.count;
+            lvl.head = o->next;   // o is always the head here
+            if (lvl.head) lvl.head->prev = nullptr;
+            else          lvl.tail = nullptr;
+        }
+        return lvl.head == nullptr;
+    }
+
+    Qty do_uncross() {
+        if (best_bid_ < 0 || best_ask_ < 0 || best_bid_ < best_ask_)
+            return 0;   // nothing overlaps (always true while continuous)
+        const int64_t lo = best_ask_, hi = best_bid_;
+        const size_t n = static_cast<size_t>(hi - lo + 1);
+
+        // Cumulative executable volume across the overlap: supply[k] =
+        // ask qty priced <= lo+k, demand[k] = bid qty priced >= lo+k.
+        // Hidden reserve participates in full.
+        std::vector<Qty> supply(n, 0), demand(n, 0);
+        Qty acc = 0;
+        for (size_t k = 0; k < n; ++k) {
+            const Level& lvl = asks_[static_cast<size_t>(lo) + k];
+            acc += lvl.total + lvl.hidden;
+            supply[k] = acc;
+        }
+        acc = 0;
+        for (size_t k = n; k-- > 0;) {
+            const Level& lvl = bids_[static_cast<size_t>(lo) + k];
+            acc += lvl.total + lvl.hidden;
+            demand[k] = acc;
+        }
+
+        // Pick the clearing price: max executed volume, then least
+        // leftover imbalance, then nearest the last trade, then lowest.
+        size_t best_k = 0;
+        Qty best_exec = 0, best_imb = 0;
+        for (size_t k = 0; k < n; ++k) {
+            Qty ex  = (demand[k] < supply[k]) ? demand[k] : supply[k];
+            Qty imb = ((demand[k] > supply[k]) ? demand[k] - supply[k]
+                                               : supply[k] - demand[k]);
+            bool better = ex > best_exec;
+            if (!better && ex == best_exec && ex > 0) {
+                if (imb != best_imb) {
+                    better = imb < best_imb;
+                } else if (has_last_) {
+                    int64_t da = min_ + lo + static_cast<int64_t>(k) - last_px_;
+                    int64_t db = min_ + lo + static_cast<int64_t>(best_k) - last_px_;
+                    if (da < 0) da = -da;
+                    if (db < 0) db = -db;
+                    better = da < db;
+                }
+            }
+            if (better) { best_k = k; best_exec = ex; best_imb = imb; }
+        }
+        if (best_exec == 0) return 0;
+        const int64_t p_idx = lo + static_cast<int64_t>(best_k);
+        const Price p = min_ + p_idx;
+
+        // Cross at p: price-time priority both sides, buy prints as taker.
+        Qty crossed = 0;
+        while (best_bid_ >= p_idx && best_ask_ >= 0 && best_ask_ <= p_idx) {
+            Level& bl = bids_[static_cast<size_t>(best_bid_)];
+            Level& al = asks_[static_cast<size_t>(best_ask_)];
+            Order* b = bl.head;
+            Order* a = al.head;
+            Qty bq = b->qty, aq = a->qty;
+            if (b->flags & kIceberg)
+                bq += extras_[static_cast<size_t>(b->ext)].reserve;
+            if (a->flags & kIceberg)
+                aq += extras_[static_cast<size_t>(a->ext)].reserve;
+            Qty f = (bq < aq) ? bq : aq;
+            Trade t{b->id, a->id, p, f, Side::Buy};
+            if (auction_fill(bl, b, f)) {
+                bid_map_.clear(static_cast<size_t>(best_bid_));
+                best_bid_ = bid_map_.find_le(best_bid_ - 1);
+            }
+            if (auction_fill(al, a, f)) {
+                ask_map_.clear(static_cast<size_t>(best_ask_));
+                best_ask_ = ask_map_.find_ge(best_ask_ + 1);
+            }
+            last_px_  = p;
+            has_last_ = true;
+            emit_trade(t);
+            crossed += f;
+        }
+        return crossed;
+    }
+
     // --- internals -------------------------------------------------------
 
     static constexpr uint8_t kStpMask     = 0x3;     // Order::flags bits 0-1
@@ -631,6 +804,10 @@ private:
     void place_limit(OrderId id, Side side, Price price, Qty qty,
                      TimeInForce tif = TimeInForce::GTC, OwnerId owner = 0,
                      StpPolicy stp = StpPolicy::CancelTaker, Qty peak = 0) {
+        if (halted_) [[unlikely]] {   // modify() reprice during a call phase
+            rest(id, side, price, qty, owner, stp, peak);
+            return;
+        }
         int64_t limit_idx = static_cast<int64_t>(idx(price));
         Qty remaining = (side == Side::Buy)
             ? match_buy(id, qty, limit_idx, owner, stp)
@@ -753,7 +930,10 @@ private:
 
     // Fire every stop the tape has armed, including stops armed by the
     // fills of earlier stops (cascades run to fixpoint, in trigger order).
+    // Nothing fires while halted; resume() pumps whatever the auction
+    // prints armed.
     void pump_stops() {
+        if (halted_) return;
         Order* s;
         while ((s = next_triggered_stop()) != nullptr) {
             OrderId id = s->id;
@@ -982,6 +1162,7 @@ private:
     Price last_px_ = 0;           // last trade price (stop triggers key off it)
     bool has_last_ = false;
     bool pumping_ = false;        // a pump_stops() loop is already running
+    bool halted_ = false;         // auction call phase: no continuous matching
     Handler& h_;
     std::vector<Event> queue_;    // deferred-mode event buffer (unused if !DeferEvents)
     int depth_ = 0;               // re-entrancy nesting depth (see Session)

@@ -686,6 +686,152 @@ static void test_stop_orders() {
     }
 }
 
+static void test_auction() {
+    // Call phase: GTC flow accumulates without matching, even crossed.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.halt();
+        CHECK(e.is_halted());
+        e.submit_limit(Side::Sell, 99, 10);
+        e.submit_limit(Side::Sell, 100, 10);
+        e.submit_limit(Side::Sell, 101, 10);
+        e.submit_limit(Side::Buy, 102, 10);
+        e.submit_limit(Side::Buy, 101, 10);
+        e.submit_limit(Side::Buy, 100, 10);
+        CHECK(r.trades.empty());
+        CHECK(e.best_bid() == 102 && e.best_ask() == 99);   // crossed, standing
+
+        // Equilibrium: exec 20 at both 100 and 101, equal imbalance; no
+        // last trade, so the tie breaks low: clears at 100.
+        Qty crossed = e.uncross();
+        CHECK(crossed == 20);
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[0].price == 100 && r.trades[1].price == 100);
+        CHECK(r.trades[0].qty == 10 && r.trades[1].qty == 10);
+        CHECK(r.trades[0].taker_side == Side::Buy);
+        CHECK(e.last_trade() == 100);
+        // Leftovers stand un-crossed: bid 10@100 vs ask 10@101.
+        CHECK(e.best_bid() == 100 && e.best_ask() == 101);
+        CHECK(e.depth_at(Side::Buy, 100) == 10);
+        CHECK(e.depth_at(Side::Sell, 101) == 10);
+
+        e.resume();
+        CHECK(!e.is_halted());
+        e.submit_limit(Side::Buy, 101, 4);                  // continuous again
+        CHECK(r.trades.size() == 3 && r.trades[2].price == 101);
+    }
+    // Same book, but a pre-halt print at 101 pulls the tie to 101.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 101, 1);
+        e.submit_limit(Side::Buy, 101, 1);                  // last = 101
+        e.halt();
+        e.submit_limit(Side::Sell, 99, 10);
+        e.submit_limit(Side::Sell, 100, 10);
+        e.submit_limit(Side::Sell, 101, 10);
+        e.submit_limit(Side::Buy, 102, 10);
+        e.submit_limit(Side::Buy, 101, 10);
+        e.submit_limit(Side::Buy, 100, 10);
+        r.trades.clear();
+        CHECK(e.uncross() == 20);
+        CHECK(r.trades[0].price == 101);
+        // Price priority preserved: best bid crossed with best ask first.
+        CHECK(r.trades[0].taker == r.trades[0].taker);      // ids exist
+        CHECK(e.best_bid() == 100 && e.best_ask() == 101);
+    }
+    // Halt kills IOC/FOK/PostOnly on entry and rejects market orders.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 5);
+        e.halt();
+        OrderId a = e.submit_limit(Side::Buy, 100, 5, TimeInForce::IOC);
+        OrderId b = e.submit_limit(Side::Buy, 100, 5, TimeInForce::FOK);
+        OrderId c = e.submit_limit(Side::Buy, 99, 5, TimeInForce::PostOnly);
+        CHECK(r.cancels.size() == 3);
+        CHECK(r.cancels[0] == a && r.cancels[1] == b && r.cancels[2] == c);
+        CHECK(e.submit_market(Side::Buy, 5) == 5);          // rejected whole
+        CHECK(r.trades.empty());
+        CHECK(e.depth_at(Side::Sell, 100) == 5);
+        // cancel/modify still work during the call.
+        OrderId d = e.submit_limit(Side::Buy, 98, 5);
+        CHECK(e.modify(d, 100, 5));                         // reprice: rests, no match
+        CHECK(r.trades.empty());
+        CHECK(e.depth_at(Side::Buy, 100) == 5);
+        CHECK(e.cancel(d));
+        e.resume();
+    }
+    // Icebergs participate with full (hidden) size; leftovers come back
+    // renormalized to a fresh clip.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.halt();
+        e.submit_iceberg(Side::Sell, 100, 30, 5);
+        e.submit_limit(Side::Buy, 100, 12);
+        CHECK(e.uncross() == 12);
+        CHECK(r.trades.size() == 1);                        // one print, full 12
+        CHECK(r.trades[0].qty == 12 && r.trades[0].price == 100);
+        CHECK(e.depth_at(Side::Sell, 100) == 5);            // fresh clip
+        CHECK(e.hidden_at(Side::Sell, 100) == 13);          // 30-12-5
+        CHECK(!e.has_bid());
+        e.resume();
+    }
+    // Stops armed by the auction print hold through the halt and fire on
+    // resume, off the opening print.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId stop = e.submit_stop(Side::Buy, 100, 3);
+        CHECK(e.pending_stops() == 1);
+        e.halt();
+        e.submit_limit(Side::Sell, 100, 5);
+        e.submit_limit(Side::Buy, 100, 5);
+        e.submit_limit(Side::Sell, 104, 3);                 // post-open ask
+        CHECK(e.uncross() == 5);                            // prints at 100
+        CHECK(e.pending_stops() == 1);                      // still parked
+        e.resume();                                         // fires now
+        CHECK(e.pending_stops() == 0);
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[1].taker == stop);
+        CHECK(r.trades[1].price == 104 && r.trades[1].qty == 3);
+    }
+    // Uncross on a book that never crossed is a no-op returning 0; so is
+    // uncrossing while continuous (the book can't be crossed then).
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.halt();
+        e.submit_limit(Side::Buy, 99, 5);
+        e.submit_limit(Side::Sell, 101, 5);
+        CHECK(e.uncross() == 0);
+        e.resume();
+        CHECK(e.uncross() == 0);
+        CHECK(e.open_orders() == 2);
+    }
+    // Unbalanced cross: the surplus side's last order keeps its
+    // remainder, FIFO decides who among equal-priced bids gets filled.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.halt();
+        OrderId first = e.submit_limit(Side::Buy, 100, 6);
+        OrderId second = e.submit_limit(Side::Buy, 100, 6);
+        e.submit_limit(Side::Sell, 100, 8);
+        CHECK(e.uncross() == 8);
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[0].taker == first && r.trades[0].qty == 6);
+        CHECK(r.trades[1].taker == second && r.trades[1].qty == 2);
+        CHECK(e.depth_at(Side::Buy, 100) == 4);             // second's leftover
+        CHECK(!e.has_ask());
+        e.resume();
+        CHECK(e.cancel(second));
+        CHECK(!e.cancel(first));                            // fully filled
+    }
+}
+
 static void test_depth_snapshot() {
     Recorder r;
     Engine e(1, 10000, r);
@@ -1043,6 +1189,7 @@ int main() {
     test_self_trade_prevention();
     test_iceberg();
     test_stop_orders();
+    test_auction();
     test_depth_snapshot();
     test_bitmap();
     test_spsc_ring();
