@@ -40,6 +40,14 @@
 //     still counts hidden reserve. modify() on an iceberg interprets qty
 //     as the new total and keeps the peak across a cancel-replace;
 //     amend-down shaves the reserve before the displayed clip.
+//   * submit_stop / submit_stop_limit: parked off-book until the last
+//     trade price reaches the trigger (buy: last >= stop, sell: last <=
+//     stop), then executed as a market order (remainder discarded) or a
+//     GTC limit (remainder rests). Triggers are evaluated after every
+//     operation; fills from one stop can arm the next (cascades run to
+//     fixpoint, buy stops ascending then sell stops descending, FIFO
+//     within a trigger level). Pending stops are invisible to depth and
+//     best-price, cancellable by id, and refused by modify()/reduce().
 //
 // Event delivery (DeferEvents policy):
 //   * false (default): the handler is called directly, mid-mutation, with
@@ -150,6 +158,31 @@ public:
         });
     }
 
+    // Stop-market: parks off-book until the last trade price crosses the
+    // trigger (buy stops arm at last >= stop_price, sell stops at
+    // last <= stop_price), then executes as a market order. If the book
+    // has already traded through the trigger on entry, it fires
+    // immediately. Pending stops are invisible to depth/best-price, can
+    // be cancelled by id, and are counted by open_orders()/pending_stops().
+    OrderId submit_stop(Side side, Price stop_price, Qty qty,
+                        OwnerId owner = 0,
+                        StpPolicy stp = StpPolicy::CancelTaker) {
+        return run([&] {
+            return do_submit_stop(side, stop_price, 0, qty, true, owner, stp);
+        });
+    }
+
+    // Stop-limit: as submit_stop, but on trigger it enters as a GTC limit
+    // at `limit_price` (matching what it can, resting the remainder).
+    OrderId submit_stop_limit(Side side, Price stop_price, Price limit_price,
+                              Qty qty, OwnerId owner = 0,
+                              StpPolicy stp = StpPolicy::CancelTaker) {
+        return run([&] {
+            return do_submit_stop(side, stop_price, limit_price, qty, false,
+                                  owner, stp);
+        });
+    }
+
     bool cancel(OrderId id) {
         return run([&] { return cancel_impl(id); });
     }
@@ -172,6 +205,17 @@ public:
     bool has_ask() const noexcept { return best_ask_ >= 0; }
     Price best_bid() const noexcept { return min_ + best_bid_; }
     Price best_ask() const noexcept { return min_ + best_ask_; }
+
+    bool  has_last_trade() const noexcept { return has_last_; }
+    Price last_trade() const noexcept { return last_px_; }
+
+    // Pending (untriggered) stop orders, total and per trigger level.
+    size_t pending_stops() const noexcept { return pending_stops_; }
+    Qty stop_depth_at(Side side, Price stop_price) const noexcept {
+        if (!in_band(stop_price) || stop_bids_.empty()) return 0;
+        const auto& book = (side == Side::Buy) ? stop_bids_ : stop_asks_;
+        return book[idx(stop_price)].total;
+    }
 
     Qty depth_at(Side side, Price price) const noexcept {
         if (!in_band(price)) return 0;
@@ -345,13 +389,22 @@ private:
         bool outermost() const noexcept { return e.depth_ == 1; }
     };
 
-    // Run one public operation under a Session, then (deferred mode only)
-    // dispatch its events once the outermost call unwinds. In the default
-    // mode this inlines to the operation body plus, in debug, the guard.
+    // Run one public operation under a Session: the operation body, then
+    // the stop-trigger pump (any fills just made may arm stops; their
+    // executions may cascade), then (deferred mode only) event dispatch
+    // once the outermost call unwinds. The pump itself submits through
+    // the internal do_/place_ paths, so `pumping_` only guards against a
+    // handler-driven re-entrant run() pumping concurrently in deferred
+    // mode -- the outer pump's loop already covers those triggers.
     template <typename F>
     auto run(F&& f) {
         Session s(*this);
         auto result = f();
+        if (!pumping_) {
+            pumping_ = true;
+            pump_stops();
+            pumping_ = false;
+        }
         if constexpr (DeferEvents) {
             if (s.outermost()) drain();
         }
@@ -390,6 +443,27 @@ private:
         return remaining;
     }
 
+    OrderId do_submit_stop(Side side, Price stop_price, Price limit_price,
+                           Qty qty, bool is_market, OwnerId owner,
+                           StpPolicy stp) {
+        if (!in_band(stop_price) || qty == 0 ||
+            (!is_market && !in_band(limit_price))) [[unlikely]] {
+            emit_reject(kInvalidOrderId);
+            return kInvalidOrderId;
+        }
+        OrderId id = next_id();
+        emit_accept(id, side, stop_price, qty);
+        if (has_last_ && stop_triggered(side, stop_price, last_px_)) {
+            // Already through the trigger: fire immediately. No second
+            // accept -- the id was announced above; fills reference it.
+            execute_stop(id, side, limit_price, qty, is_market, owner, stp);
+            return id;
+        }
+        rest_stop(id, side, stop_price, limit_price, qty, is_market, owner,
+                  stp);
+        return id;
+    }
+
     OrderId do_submit_iceberg(Side side, Price price, Qty total_qty,
                               Qty display, TimeInForce tif, OwnerId owner,
                               StpPolicy stp) {
@@ -417,7 +491,10 @@ private:
     bool cancel_impl(OrderId id) {
         Order* o = lookup(id);
         if (!o) return false;
-        remove_resting(o);
+        if (o->flags & kStopPending) [[unlikely]]
+            remove_stop(o);
+        else
+            remove_resting(o);
         orders_[id] = nullptr;
         release(o);
         emit_cancel(id);
@@ -427,6 +504,7 @@ private:
     bool do_reduce(OrderId id, Qty delta) {
         Order* o = lookup(id);
         if (!o) return false;
+        if (o->flags & kStopPending) return false;  // cancel/resubmit instead
         if (o->flags & kIceberg) [[unlikely]] {
             // Shave the hidden reserve first (the displayed clip keeps its
             // size and priority), then the displayed remainder.
@@ -460,6 +538,8 @@ private:
     bool do_modify(OrderId id, Price new_price, Qty new_qty) {
         Order* o = lookup(id);
         if (!o) return false;
+        if ((o->flags & kStopPending) && new_qty != 0)
+            return false;                           // cancel/resubmit instead
         if (new_qty == 0) return cancel_impl(id);
         if (!in_band(new_price)) return false;
 
@@ -498,8 +578,10 @@ private:
 
     // --- internals -------------------------------------------------------
 
-    static constexpr uint8_t kStpMask = 0x3;      // Order::flags bits 0-1
-    static constexpr uint8_t kIceberg = 1 << 2;   // Order::flags bit 2
+    static constexpr uint8_t kStpMask     = 0x3;     // Order::flags bits 0-1
+    static constexpr uint8_t kIceberg     = 1 << 2;  // Order::flags bit 2
+    static constexpr uint8_t kStopPending = 1 << 3;  // parked in a stop book
+    static constexpr uint8_t kStopMarket  = 1 << 4;  // stop-market on trigger
 
     int32_t alloc_extra() {
         if (extra_free_.empty()) {
@@ -571,6 +653,122 @@ private:
         return (side == Side::Buy)
             ? (best_ask_ >= 0 && min_ + best_ask_ <= price)
             : (best_bid_ >= 0 && min_ + best_bid_ >= price);
+    }
+
+    // --- stop orders -------------------------------------------------------
+
+    static bool stop_triggered(Side side, Price stop, Price last) noexcept {
+        return (side == Side::Buy) ? (last >= stop) : (last <= stop);
+    }
+
+    void ensure_stop_books() {
+        if (stop_bids_.empty()) {
+            stop_bids_.assign(n_levels_, Level{});
+            stop_asks_.assign(n_levels_, Level{});
+            stop_bid_map_ = LevelBitmap(n_levels_);
+            stop_ask_map_ = LevelBitmap(n_levels_);
+        }
+    }
+
+    // Park a pending stop in the stop book keyed by trigger price. The
+    // node reuses the intrusive-list fields; `price` holds the trigger,
+    // and a stop-limit keeps its post-trigger limit in the side table.
+    void rest_stop(OrderId id, Side side, Price stop_price, Price limit_price,
+                   Qty qty, bool is_market, OwnerId owner, StpPolicy stp) {
+        ensure_stop_books();
+        Order* o = pool_.alloc();
+        o->id = id; o->price = stop_price; o->qty = qty; o->side = side;
+        o->owner = owner;
+        o->flags = static_cast<uint8_t>(static_cast<uint8_t>(stp) |
+                                        kStopPending |
+                                        (is_market ? kStopMarket : 0));
+        o->ext = -1;
+        if (!is_market) {
+            o->ext = alloc_extra();
+            extras_[static_cast<size_t>(o->ext)].limit = limit_price;
+        }
+        o->prev = nullptr; o->next = nullptr;
+
+        size_t i = idx(stop_price);
+        auto& book = (side == Side::Buy) ? stop_bids_ : stop_asks_;
+        auto& map  = (side == Side::Buy) ? stop_bid_map_ : stop_ask_map_;
+        Level& lvl = book[i];
+        if (lvl.tail) {
+            lvl.tail->next = o;
+            o->prev = lvl.tail;
+            lvl.tail = o;
+        } else {
+            lvl.head = lvl.tail = o;
+            map.set(i);
+        }
+        lvl.total += qty;
+        ++lvl.count;
+        ++pending_stops_;
+        orders_[id] = o;
+    }
+
+    // Unlink a pending stop from its stop book. Does not free the node.
+    void remove_stop(Order* o) {
+        size_t i = idx(o->price);
+        auto& book = (o->side == Side::Buy) ? stop_bids_ : stop_asks_;
+        auto& map  = (o->side == Side::Buy) ? stop_bid_map_ : stop_ask_map_;
+        Level& lvl = book[i];
+        if (o->prev) o->prev->next = o->next; else lvl.head = o->next;
+        if (o->next) o->next->prev = o->prev; else lvl.tail = o->prev;
+        lvl.total -= o->qty;
+        --lvl.count;
+        --pending_stops_;
+        if (lvl.head == nullptr) map.clear(i);
+    }
+
+    // The next stop the current last-trade price arms, in deterministic
+    // order: buy stops first, ascending trigger (the order price rose
+    // through them), then sell stops descending; FIFO within a level.
+    Order* next_triggered_stop() {
+        if (!has_last_ || stop_bids_.empty()) return nullptr;
+        int64_t i = stop_bid_map_.find_ge(0);
+        if (i >= 0 && min_ + i <= last_px_)
+            return stop_bids_[static_cast<size_t>(i)].head;
+        i = stop_ask_map_.find_le(static_cast<int64_t>(n_levels_) - 1);
+        if (i >= 0 && min_ + i >= last_px_)
+            return stop_asks_[static_cast<size_t>(i)].head;
+        return nullptr;
+    }
+
+    // Fire a stop: market stops sweep and discard any remainder (market
+    // semantics); stop-limits enter as GTC limits and may rest.
+    void execute_stop(OrderId id, Side side, Price limit_price, Qty qty,
+                      bool is_market, OwnerId owner, StpPolicy stp) {
+        if (is_market) {
+            (void)((side == Side::Buy)
+                ? match_buy(id, qty, static_cast<int64_t>(n_levels_) - 1,
+                            owner, stp)
+                : match_sell(id, qty, 0, owner, stp));
+            stp_halt_ = false;  // remainder is discarded either way
+        } else {
+            place_limit(id, side, limit_price, qty, TimeInForce::GTC, owner,
+                        stp);
+        }
+    }
+
+    // Fire every stop the tape has armed, including stops armed by the
+    // fills of earlier stops (cascades run to fixpoint, in trigger order).
+    void pump_stops() {
+        Order* s;
+        while ((s = next_triggered_stop()) != nullptr) {
+            OrderId id = s->id;
+            Side side = s->side;
+            Qty qty = s->qty;
+            OwnerId owner = s->owner;
+            StpPolicy stp = static_cast<StpPolicy>(s->flags & kStpMask);
+            bool is_market = (s->flags & kStopMarket) != 0;
+            Price limit_price =
+                is_market ? 0 : extras_[static_cast<size_t>(s->ext)].limit;
+            remove_stop(s);
+            orders_[id] = nullptr;
+            release(s);
+            execute_stop(id, side, limit_price, qty, is_market, owner, stp);
+        }
     }
 
     // Executable qty on the opposite side priced at-or-better than `price`,
@@ -662,6 +860,8 @@ private:
             o->qty    -= fill;
             lvl.total -= fill;
             qty       -= fill;
+            last_px_  = px;
+            has_last_ = true;
             emit_trade(Trade{taker, o->id, px, fill, taker_side});
             if (o->qty == 0) {
                 if (o->flags & kIceberg) [[unlikely]] {
@@ -773,6 +973,15 @@ private:
     std::vector<Order*> orders_;  // id -> node (nullptr if gone/never rested)
     std::vector<Extra> extras_;   // cold side-state (icebergs, stops)
     std::vector<int32_t> extra_free_;
+    // Stop books: pending stops keyed by trigger price, one Level array +
+    // occupancy bitmap per side, allocated lazily on the first stop so
+    // engines that never use stops pay nothing.
+    std::vector<Level> stop_bids_, stop_asks_;
+    LevelBitmap stop_bid_map_{0}, stop_ask_map_{0};
+    size_t pending_stops_ = 0;
+    Price last_px_ = 0;           // last trade price (stop triggers key off it)
+    bool has_last_ = false;
+    bool pumping_ = false;        // a pump_stops() loop is already running
     Handler& h_;
     std::vector<Event> queue_;    // deferred-mode event buffer (unused if !DeferEvents)
     int depth_ = 0;               // re-entrancy nesting depth (see Session)

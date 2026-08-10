@@ -547,6 +547,145 @@ static void test_iceberg() {
     }
 }
 
+static void test_stop_orders() {
+    // A stop rests off-book until the tape reaches its trigger, then
+    // executes as a market order.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 5);
+        e.submit_limit(Side::Sell, 105, 5);
+        OrderId stop = e.submit_stop(Side::Buy, 103, 5);
+        CHECK(e.pending_stops() == 1);
+        CHECK(e.stop_depth_at(Side::Buy, 103) == 5);
+        CHECK(!e.has_bid());                        // invisible to the book
+        CHECK(e.open_orders() == 3);                // 2 resting + 1 pending
+
+        e.submit_limit(Side::Buy, 100, 5);          // prints 100 < 103: no fire
+        CHECK(e.pending_stops() == 1);
+        CHECK(r.trades.size() == 1);
+
+        e.submit_limit(Side::Buy, 105, 5);          // prints 105 >= 103: fires
+        CHECK(e.pending_stops() == 0);
+        // The stop went off as a market order but the ask side is empty
+        // now, so it discarded its quantity: trades are 100 and 105 only.
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[1].price == 105);
+        CHECK(stop != kInvalidOrderId);
+        CHECK(!e.cancel(stop));                     // consumed, not resting
+    }
+    // Trigger-on-entry: the tape is already through the stop.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 5);
+        e.submit_limit(Side::Buy, 100, 5);          // last = 100
+        e.submit_limit(Side::Sell, 104, 7);
+        OrderId stop = e.submit_stop(Side::Buy, 99, 4);   // 100 >= 99: fires now
+        CHECK(e.pending_stops() == 0);
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[1].taker == stop);
+        CHECK(r.trades[1].price == 104 && r.trades[1].qty == 4);
+    }
+    // Stop-limit: fires into a limit; the remainder rests at the limit.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 2);
+        e.submit_limit(Side::Buy, 100, 2);          // last = 100
+        e.submit_limit(Side::Sell, 104, 4);
+        OrderId sl = e.submit_stop_limit(Side::Buy, 100, 105, 10);
+        CHECK(r.trades.size() == 2);                // fired immediately
+        CHECK(r.trades[1].taker == sl && r.trades[1].price == 104);
+        CHECK(e.has_bid() && e.best_bid() == 105);  // 6 rested at the limit
+        CHECK(e.depth_at(Side::Buy, 105) == 6);
+        CHECK(e.cancel(sl));                        // now a normal resting order
+    }
+    // Cascade: one stop's fills arm the next; both fire in one pump.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 101, 5);
+        e.submit_limit(Side::Sell, 102, 5);
+        e.submit_limit(Side::Sell, 103, 5);
+        OrderId s1 = e.submit_stop(Side::Buy, 101, 5);
+        OrderId s2 = e.submit_stop(Side::Buy, 102, 5);
+        CHECK(e.pending_stops() == 2);
+        e.submit_limit(Side::Buy, 101, 5);          // print 101 arms s1
+        // s1 lifts 102 (last=102) arming s2; s2 lifts 103.
+        CHECK(e.pending_stops() == 0);
+        CHECK(r.trades.size() == 3);
+        CHECK(r.trades[1].taker == s1 && r.trades[1].price == 102);
+        CHECK(r.trades[2].taker == s2 && r.trades[2].price == 103);
+        CHECK(!e.has_ask());
+    }
+    // Multiple armed stops fire in trigger order (buy stops ascending).
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 106, 1);
+        e.submit_limit(Side::Sell, 110, 1);
+        e.submit_limit(Side::Sell, 111, 1);
+        OrderId hi = e.submit_stop(Side::Buy, 106, 1);
+        OrderId lo = e.submit_stop(Side::Buy, 103, 1);
+        e.submit_limit(Side::Buy, 106, 1);          // print 106 arms both
+        CHECK(e.pending_stops() == 0);
+        CHECK(r.trades.size() == 3);
+        CHECK(r.trades[1].taker == lo);             // ascending: 103 first
+        CHECK(r.trades[1].price == 110);
+        CHECK(r.trades[2].taker == hi);
+        CHECK(r.trades[2].price == 111);
+    }
+    // Sell stops mirror: trigger at last <= stop, descending order.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Buy, 95, 5);
+        e.submit_limit(Side::Buy, 90, 5);
+        OrderId stop = e.submit_stop(Side::Sell, 97, 5);
+        e.submit_limit(Side::Buy, 96, 1);
+        e.submit_limit(Side::Sell, 96, 1);          // print 96 <= 97: fires
+        CHECK(e.pending_stops() == 0);
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[1].taker == stop);
+        CHECK(r.trades[1].price == 95 && r.trades[1].qty == 5);
+    }
+    // Pending stops can be cancelled (and only cancelled).
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId stop = e.submit_stop_limit(Side::Sell, 90, 89, 5);
+        CHECK(e.pending_stops() == 1);
+        CHECK(!e.modify(stop, 91, 5));              // refuse modify
+        CHECK(!e.reduce(stop, 1));                  // refuse reduce
+        CHECK(e.cancel(stop));
+        CHECK(e.pending_stops() == 0 && e.open_orders() == 0);
+        CHECK(r.cancels.size() == 1 && r.cancels[0] == stop);
+        CHECK(!e.cancel(stop));
+        // modify to qty 0 is a cancel and is allowed on a pending stop.
+        OrderId stop2 = e.submit_stop(Side::Sell, 90, 5);
+        CHECK(e.modify(stop2, 90, 0));
+        CHECK(e.pending_stops() == 0);
+    }
+    // Rejections: bad qty, out-of-band trigger or limit.
+    {
+        Recorder r;
+        Engine e(100, 200, r);
+        CHECK(e.submit_stop(Side::Buy, 150, 0) == kInvalidOrderId);
+        CHECK(e.submit_stop(Side::Buy, 99, 5) == kInvalidOrderId);
+        CHECK(e.submit_stop_limit(Side::Buy, 150, 201, 5) == kInvalidOrderId);
+        CHECK(e.open_orders() == 0 && e.pending_stops() == 0);
+    }
+    // No trades yet: nothing can trigger, whatever the stop price.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_stop(Side::Buy, 1, 5);             // would be instantly armed
+        CHECK(e.pending_stops() == 1);              // ...if there were a tape
+        CHECK(!e.has_last_trade());
+    }
+}
+
 static void test_depth_snapshot() {
     Recorder r;
     Engine e(1, 10000, r);
@@ -749,6 +888,11 @@ static void parity_script(Eng& e) {
     e.submit_iceberg(Side::Sell, 97, 9, 4);                    // dark clips
     e.submit_limit(Side::Buy, 97, 7);                          // clip, requeue, clip
     e.submit_iceberg(Side::Buy, 60, 12, 5, TimeInForce::IOC);  // no cross: killed
+    e.submit_stop(Side::Buy, 70, 2);                           // parks (last=50)
+    e.submit_stop_limit(Side::Sell, 40, 39, 2);                // parks
+    e.submit_limit(Side::Sell, 75, 3);
+    e.submit_limit(Side::Buy, 75, 1);                          // print 75: buy stop fires
+    e.submit_market(Side::Sell, 2);                            // may print lower
     OrderId x = e.submit_limit(Side::Buy, 98, 7);
     e.modify(x, 105, 7);                                   // reprice: cancel + accept + match
     e.cancel(x);
@@ -898,6 +1042,7 @@ int main() {
     test_band_rejection();
     test_self_trade_prevention();
     test_iceberg();
+    test_stop_orders();
     test_depth_snapshot();
     test_bitmap();
     test_spsc_ring();
