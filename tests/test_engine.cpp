@@ -262,6 +262,36 @@ static void test_fok() {
     CHECK(!e.has_bid());
 }
 
+static void test_post_only() {
+    Recorder r;
+    Engine e(1, 10000, r);
+    e.submit_limit(Side::Sell, 100, 5);
+
+    // Would cross (or even just lock) the ask: killed, book untouched.
+    OrderId kill = e.submit_limit(Side::Buy, 100, 5, TimeInForce::PostOnly);
+    CHECK(r.trades.empty());
+    CHECK(r.cancels.size() == 1 && r.cancels[0] == kill);
+    CHECK(!e.has_bid());
+    CHECK(e.depth_at(Side::Sell, 100) == 5);
+    CHECK(!e.cancel(kill));                    // killed order is gone
+    OrderId thru = e.submit_limit(Side::Buy, 103, 5, TimeInForce::PostOnly);
+    CHECK(r.cancels.back() == thru && !e.has_bid());
+
+    // Passive price: rests exactly like GTC, cancellable, can later trade.
+    OrderId rest = e.submit_limit(Side::Buy, 99, 7, TimeInForce::PostOnly);
+    CHECK(e.has_bid() && e.best_bid() == 99);
+    CHECK(e.depth_at(Side::Buy, 99) == 7);
+    e.submit_limit(Side::Sell, 99, 7);
+    CHECK(r.trades.size() == 1 && r.trades[0].maker == rest);
+
+    // Empty opposite side: nothing to cross, rests.
+    Recorder r2;
+    Engine e2(1, 10000, r2);
+    OrderId sell = e2.submit_limit(Side::Sell, 105, 3, TimeInForce::PostOnly);
+    CHECK(e2.has_ask() && e2.best_ask() == 105);
+    CHECK(e2.cancel(sell));
+}
+
 static void test_band_rejection() {
     Recorder r;
     Engine e(100, 200, r);
@@ -417,6 +447,8 @@ static void parity_script(Eng& e) {
     e.submit_limit(Side::Buy, 102, 12);                    // multi-level sweep + rest
     e.submit_limit(Side::Buy, 100, 3, TimeInForce::IOC);   // IOC remainder cancel
     e.submit_limit(Side::Sell, 90, 3, TimeInForce::FOK);   // FOK against the resting bid
+    e.submit_limit(Side::Sell, 95, 2, TimeInForce::PostOnly);  // would cross: killed
+    e.submit_limit(Side::Sell, 200, 2, TimeInForce::PostOnly); // passive: rests
     OrderId x = e.submit_limit(Side::Buy, 98, 7);
     e.modify(x, 105, 7);                                   // reprice: cancel + accept + match
     e.cancel(x);
@@ -562,6 +594,7 @@ int main() {
     test_modify_can_cross();
     test_ioc();
     test_fok();
+    test_post_only();
     test_band_rejection();
     test_bitmap();
     test_spsc_ring();

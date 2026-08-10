@@ -19,7 +19,8 @@
 // Semantics:
 //   * submit_limit: matches immediately against the opposite side while
 //     crossed, then rests any remainder. Time-in-force: GTC rests the
-//     remainder, IOC cancels it, FOK executes fully or not at all.
+//     remainder, IOC cancels it, FOK executes fully or not at all,
+//     PostOnly rests without ever taking (killed if it would cross).
 //   * submit_market: matches until filled or the book is exhausted;
 //     the remainder is discarded (never rests).
 //   * cancel: O(1) removal by id.
@@ -268,6 +269,10 @@ private:
             emit_cancel(id);
             return id;
         }
+        if (tif == TimeInForce::PostOnly && would_cross(side, price)) {
+            emit_cancel(id);
+            return id;
+        }
         place_limit(id, side, price, qty, tif);
         return id;
     }
@@ -353,9 +358,11 @@ private:
         return static_cast<OrderId>(orders_.size() - 1);
     }
 
-    // Match, then rest (GTC) or cancel (IOC/FOK) the remainder. `id` must
-    // already be registered. FOK feasibility is checked by the caller, so
-    // an FOK reaching here always fills completely.
+    // Match, then rest (GTC/PostOnly) or cancel (IOC/FOK) the remainder.
+    // `id` must already be registered. FOK feasibility is checked by the
+    // caller, so an FOK reaching here always fills completely; a PostOnly
+    // reaching here cannot cross (caller kills it otherwise), so it rests
+    // in full.
     void place_limit(OrderId id, Side side, Price price, Qty qty,
                      TimeInForce tif = TimeInForce::GTC) {
         int64_t limit_idx = static_cast<int64_t>(idx(price));
@@ -363,9 +370,18 @@ private:
             ? match_buy(id, qty, limit_idx)
             : match_sell(id, qty, limit_idx);
         if (remaining > 0) {
-            if (tif == TimeInForce::GTC) rest(id, side, price, remaining);
-            else                         emit_cancel(id);
+            if (tif == TimeInForce::IOC || tif == TimeInForce::FOK)
+                emit_cancel(id);
+            else
+                rest(id, side, price, remaining);
         }
+    }
+
+    // Would a limit at `price` take liquidity right now?
+    bool would_cross(Side side, Price price) const noexcept {
+        return (side == Side::Buy)
+            ? (best_ask_ >= 0 && min_ + best_ask_ <= price)
+            : (best_bid_ >= 0 && min_ + best_bid_ >= price);
     }
 
     // Resting qty on the opposite side priced at-or-better than `price`,

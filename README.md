@@ -106,6 +106,7 @@ without losing queue position.
 |-----------------|-----------------------------------------------------------------|
 | `submit_limit`  | Matches while crossed (price-time priority, executes at the resting order's price), rests the remainder |
 | &nbsp;&nbsp;`IOC` / `FOK` | IOC cancels the unfilled remainder instead of resting it; FOK pre-checks depth at-or-better than the limit (bitmap hop over level totals) and fills completely or executes nothing |
+| &nbsp;&nbsp;`PostOnly` | Never takes liquidity: killed on entry if it would lock or cross the opposite side, otherwise rests like GTC |
 | `submit_market` | Matches until filled or book exhausted; remainder is discarded  |
 | `cancel`        | O(1) by id                                                      |
 | `modify`        | Amend-down in place keeps priority; reprice/upsize is cancel-replace |
