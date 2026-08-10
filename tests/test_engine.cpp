@@ -964,44 +964,144 @@ static void test_mold_udp64() {
 
 template <typename Eng>
 static void stress_invariants(uint64_t seed) {
-    // Randomized fuzz: after every op, best bid < best ask (no locked or
-    // crossed book) and open-order accounting stays consistent. Run against
-    // both the default and the deferred-event engine (same invariants hold).
+    // Randomized fuzz over the full order-type zoo (plain limits with
+    // every TIF, owned orders under all three STP policies, icebergs,
+    // stops and stop-limits, cancels, modifies, reduces, markets): after
+    // every op, best bid < best ask (no locked or crossed book -- stop
+    // cascades included), and at the end cancelling everything leaves
+    // zero open orders and zero pending stops. Run against both the
+    // default and the deferred-event engine (same invariants hold).
     Recorder r;
     Eng e(1, 2000, r, 1 << 16);
     uint64_t s = seed;
     auto rng = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
     std::vector<OrderId> live;
+    auto track = [&](OrderId id) {
+        if (id != kInvalidOrderId) live.push_back(id);
+    };
     for (int i = 0; i < 200000; ++i) {
         uint64_t roll = rng() % 100;
         Price px = 900 + static_cast<Price>(rng() % 200);
-        if (roll < 55 || live.empty()) {
-            Side side = (rng() & 1) ? Side::Buy : Side::Sell;
-            OrderId id = e.submit_limit(side, px, 1 + rng() % 50);
-            live.push_back(id);
-        } else if (roll < 90) {
+        Side side = (rng() & 1) ? Side::Buy : Side::Sell;
+        OwnerId owner = static_cast<OwnerId>(rng() % 4);        // 0 = anon
+        StpPolicy stp = static_cast<StpPolicy>(rng() % 3);
+        if (roll < 40 || live.empty()) {
+            track(e.submit_limit(side, px, 1 + rng() % 50,
+                                 TimeInForce::GTC, owner, stp));
+        } else if (roll < 46) {
+            track(e.submit_limit(side, px, 1 + rng() % 50,
+                                 TimeInForce::PostOnly, owner, stp));
+        } else if (roll < 55) {
+            track(e.submit_iceberg(side, px, 1 + rng() % 60, 1 + rng() % 10,
+                                   TimeInForce::GTC, owner, stp));
+        } else if (roll < 70) {
             size_t k = rng() % live.size();
             e.cancel(live[k]);  // may already be gone; that's the point
             live[k] = live.back();
             live.pop_back();
-        } else if (roll < 95) {
-            e.submit_market((rng() & 1) ? Side::Buy : Side::Sell,
-                            1 + rng() % 100);
+        } else if (roll < 75) {
+            e.submit_market(side, 1 + rng() % 100, owner, stp);
+        } else if (roll < 80) {
+            // IOC/FOK never rest, so their ids never come back.
+            e.submit_limit(side, px, 1 + rng() % 50,
+                           (roll & 1) ? TimeInForce::IOC : TimeInForce::FOK,
+                           owner, stp);
+        } else if (roll < 87) {
+            Price trig = 900 + static_cast<Price>(rng() % 200);
+            if (roll & 1) {
+                track(e.submit_stop(side, trig, 1 + rng() % 30, owner, stp));
+            } else {
+                track(e.submit_stop_limit(side, trig,
+                                          900 + static_cast<Price>(rng() % 200),
+                                          1 + rng() % 30, owner, stp));
+            }
+        } else if (roll < 94) {
+            e.modify(live[rng() % live.size()], px, 1 + rng() % 50);
         } else {
-            // IOC/FOK never rest, so their ids don't join `live`.
-            e.submit_limit((rng() & 1) ? Side::Buy : Side::Sell, px,
-                           1 + rng() % 50,
-                           (roll & 1) ? TimeInForce::IOC : TimeInForce::FOK);
+            e.reduce(live[rng() % live.size()], 1 + rng() % 10);
         }
         if (e.has_bid() && e.has_ask()) CHECK(e.best_bid() < e.best_ask());
     }
     for (OrderId id : live) e.cancel(id);
     CHECK(e.open_orders() == 0);
+    CHECK(e.pending_stops() == 0);
+}
+
+template <typename Eng>
+static void stress_auction_cycles(uint64_t seed) {
+    // Halt/uncross/resume cycles under random flow: while halted the book
+    // may cross freely; an uncross+resume must leave it un-crossed and
+    // un-locked, every time, and the final accounting must come out clean.
+    Recorder r;
+    Eng e(1, 2000, r, 1 << 16);
+    uint64_t s = seed;
+    auto rng = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+    std::vector<OrderId> live;
+    bool halted = false;
+    Qty crossed_total = 0;
+    for (int i = 0; i < 60000; ++i) {
+        if (i % 4000 == 0) {
+            e.halt();
+            halted = true;
+        } else if (i % 4000 == 700) {
+            crossed_total += e.uncross();
+            e.resume();
+            halted = false;
+            if (e.has_bid() && e.has_ask())
+                CHECK(e.best_bid() < e.best_ask());
+        }
+        uint64_t roll = rng() % 100;
+        Price px = 900 + static_cast<Price>(rng() % 200);
+        Side side = (rng() & 1) ? Side::Buy : Side::Sell;
+        OwnerId owner = static_cast<OwnerId>(rng() % 3);
+        StpPolicy stp = static_cast<StpPolicy>(rng() % 3);
+        if (roll < 45 || live.empty()) {
+            if (live.empty() || (roll & 1)) {
+                OrderId id = e.submit_limit(side, px, 1 + rng() % 50,
+                                            TimeInForce::GTC, owner, stp);
+                if (id != kInvalidOrderId) live.push_back(id);
+            } else {
+                OrderId id = e.submit_iceberg(side, px, 1 + rng() % 60,
+                                              1 + rng() % 10,
+                                              TimeInForce::GTC, owner, stp);
+                if (id != kInvalidOrderId) live.push_back(id);
+            }
+        } else if (roll < 65) {
+            size_t k = rng() % live.size();
+            e.cancel(live[k]);
+            live[k] = live.back();
+            live.pop_back();
+        } else if (roll < 72) {
+            e.submit_market(side, 1 + rng() % 60, owner, stp);
+        } else if (roll < 82) {
+            Price trig = 900 + static_cast<Price>(rng() % 200);
+            OrderId id = e.submit_stop(side, trig, 1 + rng() % 20, owner, stp);
+            if (id != kInvalidOrderId) live.push_back(id);
+        } else if (roll < 92) {
+            e.modify(live[rng() % live.size()], px, 1 + rng() % 50);
+        } else {
+            // IOC ids never rest; PostOnly ids can, so track them too.
+            OrderId id = e.submit_limit(side, px, 1 + rng() % 50,
+                                        (roll & 1) ? TimeInForce::IOC
+                                                   : TimeInForce::PostOnly,
+                                        owner, stp);
+            if (id != kInvalidOrderId) live.push_back(id);
+        }
+        if (!halted && e.has_bid() && e.has_ask())
+            CHECK(e.best_bid() < e.best_ask());
+    }
+    e.resume();
+    for (OrderId id : live) e.cancel(id);
+    CHECK(e.open_orders() == 0);
+    CHECK(e.pending_stops() == 0);
+    CHECK(crossed_total > 0);   // the cycles actually exercised the cross
 }
 
 static void test_stress_invariants() {
     stress_invariants<MatchingEngine<Recorder>>(0x9E3779B97F4A7C15ull);
     stress_invariants<ReentrantMatchingEngine<Recorder>>(0xD1B54A32D192ED03ull);
+    stress_auction_cycles<MatchingEngine<Recorder>>(0xA0761D6478BD642Full);
+    stress_auction_cycles<ReentrantMatchingEngine<Recorder>>(0xE7037ED1A0B428DBull);
 }
 
 // Records the full ordered event tape so two engines can be compared.
