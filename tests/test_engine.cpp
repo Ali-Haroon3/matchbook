@@ -301,6 +301,112 @@ static void test_band_rejection() {
     CHECK(e.submit_limit(Side::Sell, 200, 5) != kInvalidOrderId);
 }
 
+static void test_self_trade_prevention() {
+    // CancelTaker (default): the incoming order stops dead at its own
+    // resting order and its remainder is cancelled; the maker stays.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId mine = e.submit_limit(Side::Sell, 100, 5, TimeInForce::GTC, 7);
+        OrderId taker = e.submit_limit(Side::Buy, 100, 8, TimeInForce::GTC, 7);
+        CHECK(r.trades.empty());
+        CHECK(r.cancels.size() == 1 && r.cancels[0] == taker);
+        CHECK(e.depth_at(Side::Sell, 100) == 5);
+        CHECK(!e.has_bid());                       // remainder must not rest
+        CHECK(e.cancel(mine));
+    }
+    // Other people's orders ahead of mine still trade; the halt happens
+    // only when the sweep reaches the same-owner order.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId theirs = e.submit_limit(Side::Sell, 100, 4, TimeInForce::GTC, 9);
+        OrderId mine = e.submit_limit(Side::Sell, 100, 5, TimeInForce::GTC, 7);
+        e.submit_limit(Side::Buy, 100, 10, TimeInForce::GTC, 7);
+        CHECK(r.trades.size() == 1 && r.trades[0].maker == theirs);
+        CHECK(r.trades[0].qty == 4);
+        CHECK(e.depth_at(Side::Sell, 100) == 5);   // mine untouched
+        CHECK(!e.has_bid());
+        CHECK(e.cancel(mine));
+    }
+    // CancelMaker: my stale resting order is cancelled and the incoming
+    // order keeps matching through it, across levels.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId mine = e.submit_limit(Side::Sell, 100, 5, TimeInForce::GTC, 7);
+        OrderId theirs = e.submit_limit(Side::Sell, 101, 6, TimeInForce::GTC, 9);
+        OrderId in = e.submit_limit(Side::Buy, 101, 6, TimeInForce::GTC, 7,
+                                    StpPolicy::CancelMaker);
+        CHECK(r.cancels.size() == 1 && r.cancels[0] == mine);
+        CHECK(r.trades.size() == 1 && r.trades[0].maker == theirs);
+        CHECK(r.trades[0].qty == 6 && r.trades[0].taker == in);
+        CHECK(!e.has_ask() && !e.has_bid());
+        CHECK(e.open_orders() == 0);
+    }
+    // CancelBoth: resting order cancelled, incoming remainder cancelled.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId mine = e.submit_limit(Side::Sell, 100, 5, TimeInForce::GTC, 7);
+        e.submit_limit(Side::Sell, 101, 6, TimeInForce::GTC, 9);
+        OrderId in = e.submit_limit(Side::Buy, 101, 8, TimeInForce::GTC, 7,
+                                    StpPolicy::CancelBoth);
+        CHECK(r.trades.empty());
+        CHECK(r.cancels.size() == 2);
+        CHECK(r.cancels[0] == mine && r.cancels[1] == in);
+        CHECK(e.depth_at(Side::Sell, 101) == 6);   // the stranger survives
+        CHECK(!e.has_bid());
+    }
+    // Owner 0 never triggers STP -- anonymous flow can self-cross.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 5);
+        e.submit_limit(Side::Buy, 100, 5);
+        CHECK(r.trades.size() == 1);
+    }
+    // Market order + STP: stops at the own order, remainder reported
+    // unfilled, book left intact behind the halt.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 3, TimeInForce::GTC, 9);
+        e.submit_limit(Side::Sell, 101, 5, TimeInForce::GTC, 7);
+        e.submit_limit(Side::Sell, 102, 5, TimeInForce::GTC, 9);
+        Qty rem = e.submit_market(Side::Buy, 10, 7);
+        CHECK(rem == 7);                           // 3 filled, then halt
+        CHECK(r.trades.size() == 1 && r.trades[0].qty == 3);
+        CHECK(e.depth_at(Side::Sell, 101) == 5);
+        CHECK(e.depth_at(Side::Sell, 102) == 5);
+    }
+    // FOK whose feasibility was met only by own liquidity: STP halts the
+    // fill mid-way and cancels the remainder (documented interaction).
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 4, TimeInForce::GTC, 9);
+        e.submit_limit(Side::Sell, 101, 6, TimeInForce::GTC, 7);
+        OrderId fok = e.submit_limit(Side::Buy, 101, 10, TimeInForce::FOK, 7);
+        CHECK(r.trades.size() == 1 && r.trades[0].qty == 4);
+        CHECK(r.cancels.back() == fok);
+        CHECK(!e.has_bid());
+    }
+    // Cancel-replace keeps owner and policy: repricing my bid through my
+    // own ask still refuses to self-trade.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ask = e.submit_limit(Side::Sell, 105, 5, TimeInForce::GTC, 7);
+        OrderId bid = e.submit_limit(Side::Buy, 100, 5, TimeInForce::GTC, 7);
+        CHECK(e.modify(bid, 105, 5));              // would cross own ask
+        CHECK(r.trades.empty());
+        CHECK(e.depth_at(Side::Sell, 105) == 5);   // maker untouched
+        CHECK(!e.has_bid());                       // replaced bid was killed
+        CHECK(e.cancel(ask));
+    }
+}
+
 static void test_depth_snapshot() {
     Recorder r;
     Engine e(1, 10000, r);
@@ -496,6 +602,10 @@ static void parity_script(Eng& e) {
     e.submit_limit(Side::Sell, 90, 3, TimeInForce::FOK);   // FOK against the resting bid
     e.submit_limit(Side::Sell, 95, 2, TimeInForce::PostOnly);  // would cross: killed
     e.submit_limit(Side::Sell, 200, 2, TimeInForce::PostOnly); // passive: rests
+    e.submit_limit(Side::Sell, 96, 4, TimeInForce::GTC, 7);    // owned resting ask
+    e.submit_limit(Side::Buy, 96, 6, TimeInForce::GTC, 7);     // STP: taker killed
+    e.submit_limit(Side::Buy, 96, 6, TimeInForce::GTC, 8,
+                   StpPolicy::CancelMaker);                    // different owner: trades
     OrderId x = e.submit_limit(Side::Buy, 98, 7);
     e.modify(x, 105, 7);                                   // reprice: cancel + accept + match
     e.cancel(x);
@@ -643,6 +753,7 @@ int main() {
     test_fok();
     test_post_only();
     test_band_rejection();
+    test_self_trade_prevention();
     test_depth_snapshot();
     test_bitmap();
     test_spsc_ring();

@@ -28,6 +28,12 @@
 //     (in-place amend); any price change or qty increase is treated as
 //     cancel-replace and goes to the back of the queue, re-matching on
 //     entry. This mirrors real exchange semantics (e.g. Nasdaq).
+//   * self-trade prevention: submitting with a nonzero owner id arms STP
+//     against resting orders with the same owner. The incoming order's
+//     StpPolicy decides who yields: CancelTaker stops the match and kills
+//     the incoming remainder, CancelMaker cancels the resting order and
+//     keeps matching, CancelBoth does both. Owner 0 (default) disables
+//     STP entirely, so the check is one predictable compare per fill.
 //
 // Event delivery (DeferEvents policy):
 //   * false (default): the handler is called directly, mid-mutation, with
@@ -52,14 +58,20 @@
 
 namespace matchbook {
 
+// 48 bytes: the owner/flags ride in what used to be padding, so the node
+// is no bigger than it was without them.
 struct Order {
     OrderId id;
     Price   price;
     Qty     qty;      // remaining
-    Side    side;
     Order*  prev;
     Order*  next;
+    OwnerId owner;    // 0 = no self-trade prevention
+    Side    side;
+    uint8_t flags;    // bits 0-1: StpPolicy (applies when this order takes)
 };
+
+static_assert(sizeof(Order) <= 48, "keep the order node hot-path small");
 
 // One aggregated price level, as reported by top_levels()/visit_levels().
 struct LevelView {
@@ -91,15 +103,24 @@ public:
     // Returns the assigned order id, or kInvalidOrderId if the price is
     // outside the book's band. IOC cancels any unfilled remainder instead
     // of resting it; FOK executes fully or not at all (killed via
-    // on_cancel with no trades).
+    // on_cancel with no trades). A nonzero `owner` opts into self-trade
+    // prevention under `stp` (see StpPolicy); note the FOK feasibility
+    // pre-check counts own resting orders, so an FOK stopped by STP
+    // mid-fill cancels its remainder like an IOC would.
     OrderId submit_limit(Side side, Price price, Qty qty,
-                         TimeInForce tif = TimeInForce::GTC) {
-        return run([&] { return do_submit_limit(side, price, qty, tif); });
+                         TimeInForce tif = TimeInForce::GTC,
+                         OwnerId owner = 0,
+                         StpPolicy stp = StpPolicy::CancelTaker) {
+        return run([&] {
+            return do_submit_limit(side, price, qty, tif, owner, stp);
+        });
     }
 
-    // Returns unfilled quantity (0 if fully filled).
-    Qty submit_market(Side side, Qty qty) {
-        return run([&] { return do_submit_market(side, qty); });
+    // Returns unfilled quantity (0 if fully filled). An STP stop counts
+    // the rest as unfilled (market remainders are discarded, never rest).
+    Qty submit_market(Side side, Qty qty, OwnerId owner = 0,
+                      StpPolicy stp = StpPolicy::CancelTaker) {
+        return run([&] { return do_submit_market(side, qty, owner, stp); });
     }
 
     bool cancel(OrderId id) {
@@ -296,7 +317,8 @@ private:
 
     // --- operations ------------------------------------------------------
 
-    OrderId do_submit_limit(Side side, Price price, Qty qty, TimeInForce tif) {
+    OrderId do_submit_limit(Side side, Price price, Qty qty, TimeInForce tif,
+                            OwnerId owner, StpPolicy stp) {
         if (!in_band(price) || qty == 0) [[unlikely]] {
             emit_reject(kInvalidOrderId);
             return kInvalidOrderId;
@@ -311,16 +333,18 @@ private:
             emit_cancel(id);
             return id;
         }
-        place_limit(id, side, price, qty, tif);
+        place_limit(id, side, price, qty, tif, owner, stp);
         return id;
     }
 
-    Qty do_submit_market(Side side, Qty qty) {
+    Qty do_submit_market(Side side, Qty qty, OwnerId owner, StpPolicy stp) {
         OrderId id = next_id();
         emit_accept(id, side, 0, qty);
-        return (side == Side::Buy)
-            ? match_buy(id, qty, static_cast<int64_t>(n_levels_) - 1)
-            : match_sell(id, qty, 0);
+        Qty remaining = (side == Side::Buy)
+            ? match_buy(id, qty, static_cast<int64_t>(n_levels_) - 1, owner, stp)
+            : match_sell(id, qty, 0, owner, stp);
+        stp_halt_ = false;  // market remainders are discarded either way
+        return remaining;
     }
 
     // Shared cancel body; also called from do_modify() so the re-entrancy
@@ -366,17 +390,22 @@ private:
         // cancel/accept pair so the event stream reflects the semantics --
         // the old resting order is gone and a new one (same id) is accepted,
         // mirroring submit_limit, which fires on_accept before it matches.
+        // Owner and STP policy carry over to the re-entry match.
         Side side = o->side;
+        OwnerId owner = o->owner;
+        StpPolicy stp = static_cast<StpPolicy>(o->flags & kStpMask);
         remove_resting(o);
         orders_[id] = nullptr;
         pool_.free(o);
         emit_cancel(id);
         emit_accept(id, side, new_price, new_qty);
-        place_limit(id, side, new_price, new_qty);
+        place_limit(id, side, new_price, new_qty, TimeInForce::GTC, owner, stp);
         return true;
     }
 
     // --- internals -------------------------------------------------------
+
+    static constexpr uint8_t kStpMask = 0x3;  // Order::flags bits 0-1
 
     bool in_band(Price p) const noexcept {
         return p >= min_ && p < min_ + static_cast<Price>(n_levels_);
@@ -398,20 +427,28 @@ private:
 
     // Match, then rest (GTC/PostOnly) or cancel (IOC/FOK) the remainder.
     // `id` must already be registered. FOK feasibility is checked by the
-    // caller, so an FOK reaching here always fills completely; a PostOnly
-    // reaching here cannot cross (caller kills it otherwise), so it rests
-    // in full.
+    // caller, so an FOK reaching here fills completely unless STP stops
+    // it; a PostOnly reaching here cannot cross (caller kills it
+    // otherwise), so it rests in full. An STP halt cancels the remainder
+    // outright -- it must not rest, or the next opposite-side own order
+    // would face it again.
     void place_limit(OrderId id, Side side, Price price, Qty qty,
-                     TimeInForce tif = TimeInForce::GTC) {
+                     TimeInForce tif = TimeInForce::GTC, OwnerId owner = 0,
+                     StpPolicy stp = StpPolicy::CancelTaker) {
         int64_t limit_idx = static_cast<int64_t>(idx(price));
         Qty remaining = (side == Side::Buy)
-            ? match_buy(id, qty, limit_idx)
-            : match_sell(id, qty, limit_idx);
+            ? match_buy(id, qty, limit_idx, owner, stp)
+            : match_sell(id, qty, limit_idx, owner, stp);
+        if (stp_halt_) {
+            stp_halt_ = false;
+            if (remaining > 0) emit_cancel(id);
+            return;
+        }
         if (remaining > 0) {
             if (tif == TimeInForce::IOC || tif == TimeInForce::FOK)
                 emit_cancel(id);
             else
-                rest(id, side, price, remaining);
+                rest(id, side, price, remaining, owner, stp);
         }
     }
 
@@ -440,36 +477,63 @@ private:
     }
 
     // Aggressive buy: lift asks from best_ask_ upward while <= limit_idx.
-    Qty match_buy(OrderId taker, Qty qty, int64_t limit_idx) {
+    Qty match_buy(OrderId taker, Qty qty, int64_t limit_idx, OwnerId owner,
+                  StpPolicy stp) {
         while (qty > 0 && best_ask_ >= 0 && best_ask_ <= limit_idx) {
             qty = sweep_level(asks_[best_ask_], taker, qty,
-                              min_ + best_ask_, Side::Buy);
+                              min_ + best_ask_, Side::Buy, owner, stp);
             if (asks_[best_ask_].head == nullptr) {
                 ask_map_.clear(static_cast<size_t>(best_ask_));
                 best_ask_ = ask_map_.find_ge(best_ask_ + 1);
             }
+            if (stp_halt_) break;
         }
         return qty;
     }
 
     // Aggressive sell: hit bids from best_bid_ downward while >= limit_idx.
-    Qty match_sell(OrderId taker, Qty qty, int64_t limit_idx) {
+    Qty match_sell(OrderId taker, Qty qty, int64_t limit_idx, OwnerId owner,
+                   StpPolicy stp) {
         while (qty > 0 && best_bid_ >= 0 && best_bid_ >= limit_idx) {
             qty = sweep_level(bids_[best_bid_], taker, qty,
-                              min_ + best_bid_, Side::Sell);
+                              min_ + best_bid_, Side::Sell, owner, stp);
             if (bids_[best_bid_].head == nullptr) {
                 bid_map_.clear(static_cast<size_t>(best_bid_));
                 best_bid_ = bid_map_.find_le(best_bid_ - 1);
             }
+            if (stp_halt_) break;
         }
         return qty;
     }
 
+    // Unlink and free the level head (the order the sweep is standing on),
+    // emitting on_cancel. Returns the new head.
+    Order* cancel_head(Level& lvl, Order* o) {
+        Order* next = o->next;
+        lvl.total -= o->qty;
+        --lvl.count;
+        orders_[o->id] = nullptr;
+        emit_cancel(o->id);
+        pool_.free(o);
+        lvl.head = next;
+        if (next) next->prev = nullptr;
+        else      lvl.tail = nullptr;
+        return next;
+    }
+
     // Fill resting orders at one level FIFO. Returns taker qty remaining.
+    // Sets stp_halt_ (and stops) if self-trade prevention says the taker
+    // may not continue.
     Qty sweep_level(Level& lvl, OrderId taker, Qty qty, Price px,
-                    Side taker_side) {
+                    Side taker_side, OwnerId taker_owner, StpPolicy stp) {
         Order* o = lvl.head;
         while (o != nullptr && qty > 0) {
+            if (taker_owner != 0 && o->owner == taker_owner) [[unlikely]] {
+                if (stp != StpPolicy::CancelTaker) o = cancel_head(lvl, o);
+                if (stp == StpPolicy::CancelMaker) continue;
+                stp_halt_ = true;   // CancelTaker / CancelBoth
+                break;
+            }
             Qty fill = (qty < o->qty) ? qty : o->qty;
             o->qty    -= fill;
             lvl.total -= fill;
@@ -489,9 +553,11 @@ private:
         return qty;
     }
 
-    void rest(OrderId id, Side side, Price price, Qty qty) {
+    void rest(OrderId id, Side side, Price price, Qty qty, OwnerId owner,
+              StpPolicy stp) {
         Order* o = pool_.alloc();
         o->id = id; o->price = price; o->qty = qty; o->side = side;
+        o->owner = owner; o->flags = static_cast<uint8_t>(stp);
         o->prev = nullptr; o->next = nullptr;
 
         size_t i = idx(price);
@@ -550,6 +616,7 @@ private:
     Handler& h_;
     std::vector<Event> queue_;    // deferred-mode event buffer (unused if !DeferEvents)
     int depth_ = 0;               // re-entrancy nesting depth (see Session)
+    bool stp_halt_ = false;       // sweep hit a same-owner resting order
 };
 
 // Fully re-entrant variant: Handler callbacks run after each operation
