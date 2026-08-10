@@ -46,14 +46,30 @@ target_link_libraries(replay PRIVATE Threads::Threads)
 target_link_libraries(mcast  PRIVATE Threads::Threads)
 
 # Optional Python bindings. Off by default so the core stays
-# zero-dependency; pybind11 is fetched only when this is enabled.
+# zero-dependency. An installed pybind11 (e.g. `pip install pybind11`)
+# is preferred; otherwise it is fetched -- so offline builds work
+# anywhere pybind11 is already present.
 option(MATCHBOOK_PYTHON "Build the pybind11 Python module" OFF)
 if(MATCHBOOK_PYTHON)
-    include(FetchContent)
-    FetchContent_Declare(pybind11
-        URL https://github.com/pybind/pybind11/archive/refs/tags/v2.13.6.tar.gz
-        URL_HASH SHA256=e08cb87f4773da97fa7b5f035de8763abc656d87d5773e62f6da0587d1f0ec20)
-    FetchContent_MakeAvailable(pybind11)
+    find_package(pybind11 CONFIG QUIET)
+    if(NOT pybind11_FOUND)
+        # Hint: pip's cmake dir, if pybind11 is installed but not on the
+        # default prefix path.
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E env python3 -m pybind11 --cmakedir
+            OUTPUT_VARIABLE _pybind11_pip_dir OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        if(_pybind11_pip_dir)
+            find_package(pybind11 CONFIG QUIET PATHS "${_pybind11_pip_dir}")
+        endif()
+    endif()
+    if(NOT pybind11_FOUND)
+        include(FetchContent)
+        FetchContent_Declare(pybind11
+            URL https://github.com/pybind/pybind11/archive/refs/tags/v2.13.6.tar.gz
+            URL_HASH SHA256=e08cb87f4773da97fa7b5f035de8763abc656d87d5773e62f6da0587d1f0ec20)
+        FetchContent_MakeAvailable(pybind11)
+    endif()
     pybind11_add_module(pymatchbook bindings/py_matchbook.cpp)
     target_link_libraries(pymatchbook PRIVATE matchbook)
     set_target_properties(pymatchbook PROPERTIES OUTPUT_NAME matchbook)
