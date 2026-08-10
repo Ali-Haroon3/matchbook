@@ -407,6 +407,146 @@ static void test_self_trade_prevention() {
     }
 }
 
+static void test_iceberg() {
+    // Resting shape: display clip visible, reserve hidden, one order.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Sell, 100, 25, 10);
+        CHECK(e.best_ask() == 100);
+        CHECK(e.depth_at(Side::Sell, 100) == 10);
+        CHECK(e.hidden_at(Side::Sell, 100) == 15);
+        CHECK(e.order_count_at(Side::Sell, 100) == 1);
+        auto top = e.top_levels(Side::Sell, 3);
+        CHECK(top.size() == 1 && top[0].qty == 10);
+
+        // A lone iceberg refills clip after clip against one taker:
+        // 10 + 10 + 5, three prints against the same maker.
+        e.submit_limit(Side::Buy, 100, 25);
+        CHECK(r.trades.size() == 3);
+        CHECK(r.trades[0].qty == 10 && r.trades[0].maker == ice);
+        CHECK(r.trades[1].qty == 10 && r.trades[1].maker == ice);
+        CHECK(r.trades[2].qty == 5 && r.trades[2].maker == ice);
+        CHECK(!e.has_ask() && !e.has_bid());
+        CHECK(e.open_orders() == 0);
+    }
+    // Replenished clips lose time priority: after the first clip fills,
+    // the order behind at the level trades before the next clip.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Sell, 100, 10, 5);
+        OrderId behind = e.submit_limit(Side::Sell, 100, 3);
+        e.submit_limit(Side::Buy, 100, 10);
+        CHECK(r.trades.size() == 3);
+        CHECK(r.trades[0].maker == ice && r.trades[0].qty == 5);
+        CHECK(r.trades[1].maker == behind && r.trades[1].qty == 3);
+        CHECK(r.trades[2].maker == ice && r.trades[2].qty == 2);
+        CHECK(e.depth_at(Side::Sell, 100) == 3);   // clip remainder shows
+        CHECK(e.hidden_at(Side::Sell, 100) == 0);
+        CHECK(e.order_count_at(Side::Sell, 100) == 1);
+    }
+    // Crossing on entry: aggressive part executes for full size, only the
+    // remainder rests dark.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 5);
+        e.submit_iceberg(Side::Buy, 100, 12, 4);
+        CHECK(r.trades.size() == 1 && r.trades[0].qty == 5);
+        CHECK(e.depth_at(Side::Buy, 100) == 4);
+        CHECK(e.hidden_at(Side::Buy, 100) == 3);
+    }
+    // FOK feasibility counts hidden reserve.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_iceberg(Side::Sell, 100, 30, 5);
+        OrderId fok = e.submit_limit(Side::Buy, 100, 25, TimeInForce::FOK);
+        CHECK(r.trades.size() == 5);               // 5 clips of 5
+        CHECK(r.cancels.empty());
+        Qty sum = 0;
+        for (auto& t : r.trades) { sum += t.qty; CHECK(t.taker == fok); }
+        CHECK(sum == 25);
+        CHECK(e.depth_at(Side::Sell, 100) == 5);   // 30 - 25 left showing
+        CHECK(e.hidden_at(Side::Sell, 100) == 0);
+    }
+    // Cancel removes displayed and hidden alike.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Buy, 90, 40, 8);
+        e.submit_limit(Side::Sell, 90, 3);          // nibble the clip
+        CHECK(e.depth_at(Side::Buy, 90) == 5);
+        CHECK(e.cancel(ice));
+        CHECK(!e.has_bid());
+        CHECK(e.hidden_at(Side::Buy, 90) == 0);
+        CHECK(e.open_orders() == 0);
+    }
+    // reduce() shaves the reserve first, keeping the clip and priority.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Sell, 100, 20, 6);
+        CHECK(e.reduce(ice, 8));                    // 12 left: 6 shown, 6 dark
+        CHECK(e.depth_at(Side::Sell, 100) == 6);
+        CHECK(e.hidden_at(Side::Sell, 100) == 6);
+        CHECK(e.reduce(ice, 8));                    // 4 left: all shown
+        CHECK(e.depth_at(Side::Sell, 100) == 4);
+        CHECK(e.hidden_at(Side::Sell, 100) == 0);
+        CHECK(e.reduce(ice, 4));                    // gone
+        CHECK(!e.has_ask() && e.open_orders() == 0);
+    }
+    // modify(): qty means new total. Amend-down keeps priority; reprice
+    // is cancel-replace but stays an iceberg with the same peak.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Sell, 100, 20, 6);
+        OrderId behind = e.submit_limit(Side::Sell, 100, 5);
+        CHECK(e.modify(ice, 100, 10));              // shave: 6 shown, 4 dark
+        CHECK(e.depth_at(Side::Sell, 100) == 11);
+        CHECK(e.hidden_at(Side::Sell, 100) == 4);
+        e.submit_limit(Side::Buy, 100, 6);
+        CHECK(r.trades[0].maker == ice);            // priority kept
+
+        CHECK(e.modify(ice, 101, 9));               // reprice, still iceberg
+        CHECK(e.depth_at(Side::Sell, 101) == 6);    // peak carried over
+        CHECK(e.hidden_at(Side::Sell, 101) == 3);
+        CHECK(e.depth_at(Side::Sell, 100) == 5);    // `behind` stayed
+        CHECK(e.cancel(ice) && e.cancel(behind));
+    }
+    // STP CancelMaker wipes a whole resting iceberg, hidden included.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Sell, 100, 30, 5, TimeInForce::GTC, 7);
+        e.submit_limit(Side::Buy, 100, 3, TimeInForce::GTC, 7,
+                       StpPolicy::CancelMaker);
+        CHECK(r.trades.empty());
+        CHECK(r.cancels.size() == 1 && r.cancels[0] == ice);
+        CHECK(!e.has_ask());                        // iceberg fully gone
+        CHECK(e.hidden_at(Side::Sell, 100) == 0);
+        CHECK(e.has_bid() && e.depth_at(Side::Buy, 100) == 3);  // taker rests
+        CHECK(e.open_orders() == 1);
+    }
+    // display >= total collapses to a plain limit: nothing hidden.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_iceberg(Side::Buy, 95, 7, 50);
+        CHECK(e.depth_at(Side::Buy, 95) == 7);
+        CHECK(e.hidden_at(Side::Buy, 95) == 0);
+    }
+    // Zero display or zero qty is rejected outright.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        CHECK(e.submit_iceberg(Side::Buy, 95, 10, 0) == kInvalidOrderId);
+        CHECK(e.submit_iceberg(Side::Buy, 95, 0, 5) == kInvalidOrderId);
+    }
+}
+
 static void test_depth_snapshot() {
     Recorder r;
     Engine e(1, 10000, r);
@@ -606,6 +746,9 @@ static void parity_script(Eng& e) {
     e.submit_limit(Side::Buy, 96, 6, TimeInForce::GTC, 7);     // STP: taker killed
     e.submit_limit(Side::Buy, 96, 6, TimeInForce::GTC, 8,
                    StpPolicy::CancelMaker);                    // different owner: trades
+    e.submit_iceberg(Side::Sell, 97, 9, 4);                    // dark clips
+    e.submit_limit(Side::Buy, 97, 7);                          // clip, requeue, clip
+    e.submit_iceberg(Side::Buy, 60, 12, 5, TimeInForce::IOC);  // no cross: killed
     OrderId x = e.submit_limit(Side::Buy, 98, 7);
     e.modify(x, 105, 7);                                   // reprice: cancel + accept + match
     e.cancel(x);
@@ -754,6 +897,7 @@ int main() {
     test_post_only();
     test_band_rejection();
     test_self_trade_prevention();
+    test_iceberg();
     test_depth_snapshot();
     test_bitmap();
     test_spsc_ring();

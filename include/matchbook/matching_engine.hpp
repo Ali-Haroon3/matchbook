@@ -34,6 +34,12 @@
 //     the incoming remainder, CancelMaker cancels the resting order and
 //     keeps matching, CancelBoth does both. Owner 0 (default) disables
 //     STP entirely, so the check is one predictable compare per fill.
+//   * submit_iceberg: rests showing at most `display`; an exhausted clip
+//     replenishes from the hidden reserve and re-queues at the back of
+//     the level. Book depth reports displayed qty only; FOK feasibility
+//     still counts hidden reserve. modify() on an iceberg interprets qty
+//     as the new total and keeps the peak across a cancel-replace;
+//     amend-down shaves the reserve before the displayed clip.
 //
 // Event delivery (DeferEvents policy):
 //   * false (default): the handler is called directly, mid-mutation, with
@@ -58,17 +64,20 @@
 
 namespace matchbook {
 
-// 48 bytes: the owner/flags ride in what used to be padding, so the node
-// is no bigger than it was without them.
+// 48 bytes: owner/flags/ext ride in what used to be padding, so the node
+// is no bigger than it was without them. Cold state for special order
+// types (iceberg reserve, stop trigger data) lives in a side table
+// reached through `ext`, keeping the plain-limit hot path untouched.
 struct Order {
     OrderId id;
     Price   price;
-    Qty     qty;      // remaining
+    Qty     qty;      // remaining (icebergs: the *displayed* remainder)
     Order*  prev;
     Order*  next;
+    int32_t ext;      // extras_ index, -1 for plain orders
     OwnerId owner;    // 0 = no self-trade prevention
     Side    side;
-    uint8_t flags;    // bits 0-1: StpPolicy (applies when this order takes)
+    uint8_t flags;    // bits 0-1: StpPolicy; bit 2: iceberg
 };
 
 static_assert(sizeof(Order) <= 48, "keep the order node hot-path small");
@@ -123,6 +132,24 @@ public:
         return run([&] { return do_submit_market(side, qty, owner, stp); });
     }
 
+    // Iceberg: rests showing at most `display`; every time the displayed
+    // clip is exhausted by fills it is replenished from the hidden reserve
+    // and re-queued at the back of the level, i.e. each clip has its own
+    // time priority (exchange-standard). The full quantity is disclosed
+    // only in this order's own on_accept; depth_at()/top_levels() see the
+    // displayed clip. Hidden reserve still counts for FOK feasibility. If
+    // the order crosses on entry, the aggressive part executes like a
+    // plain limit for the full quantity; only the remainder rests dark.
+    OrderId submit_iceberg(Side side, Price price, Qty total_qty, Qty display,
+                           TimeInForce tif = TimeInForce::GTC,
+                           OwnerId owner = 0,
+                           StpPolicy stp = StpPolicy::CancelTaker) {
+        return run([&] {
+            return do_submit_iceberg(side, price, total_qty, display, tif,
+                                     owner, stp);
+        });
+    }
+
     bool cancel(OrderId id) {
         return run([&] { return cancel_impl(id); });
     }
@@ -150,6 +177,14 @@ public:
         if (!in_band(price)) return 0;
         const auto& levels = (side == Side::Buy) ? bids_ : asks_;
         return levels[idx(price)].total;
+    }
+
+    // Hidden (iceberg reserve) quantity at a level. Not part of the
+    // published book view -- provided for analytics and tests.
+    Qty hidden_at(Side side, Price price) const noexcept {
+        if (!in_band(price)) return 0;
+        const auto& levels = (side == Side::Buy) ? bids_ : asks_;
+        return levels[idx(price)].hidden;
     }
 
     uint32_t order_count_at(Side side, Price price) const noexcept {
@@ -186,10 +221,18 @@ public:
 
 private:
     struct Level {
-        Qty      total = 0;
-        Order*   head  = nullptr;
-        Order*   tail  = nullptr;
-        uint32_t count = 0;   // resting orders at this level
+        Qty      total  = 0;  // displayed resting quantity
+        Qty      hidden = 0;  // iceberg reserve behind the displayed clips
+        Order*   head   = nullptr;
+        Order*   tail   = nullptr;
+        uint32_t count  = 0;  // resting orders at this level
+    };
+
+    // Cold side-state for order types that outgrow the 48-byte node.
+    struct Extra {
+        Qty   reserve = 0;  // iceberg: hidden remainder
+        Qty   peak    = 0;  // iceberg: clip size to replenish to
+        Price limit   = 0;  // pending stop-limit: post-trigger limit price
     };
 
     // --- event delivery --------------------------------------------------
@@ -347,6 +390,28 @@ private:
         return remaining;
     }
 
+    OrderId do_submit_iceberg(Side side, Price price, Qty total_qty,
+                              Qty display, TimeInForce tif, OwnerId owner,
+                              StpPolicy stp) {
+        if (!in_band(price) || total_qty == 0 || display == 0) [[unlikely]] {
+            emit_reject(kInvalidOrderId);
+            return kInvalidOrderId;
+        }
+        OrderId id = next_id();
+        emit_accept(id, side, price, total_qty);
+        if (tif == TimeInForce::FOK &&
+            fillable(side, price, total_qty) < total_qty) {
+            emit_cancel(id);
+            return id;
+        }
+        if (tif == TimeInForce::PostOnly && would_cross(side, price)) {
+            emit_cancel(id);
+            return id;
+        }
+        place_limit(id, side, price, total_qty, tif, owner, stp, display);
+        return id;
+    }
+
     // Shared cancel body; also called from do_modify() so the re-entrancy
     // guard / drain is owned by exactly one Session per public call.
     bool cancel_impl(OrderId id) {
@@ -354,7 +419,7 @@ private:
         if (!o) return false;
         remove_resting(o);
         orders_[id] = nullptr;
-        pool_.free(o);
+        release(o);
         emit_cancel(id);
         return true;
     }
@@ -362,10 +427,29 @@ private:
     bool do_reduce(OrderId id, Qty delta) {
         Order* o = lookup(id);
         if (!o) return false;
+        if (o->flags & kIceberg) [[unlikely]] {
+            // Shave the hidden reserve first (the displayed clip keeps its
+            // size and priority), then the displayed remainder.
+            Extra& x = extras_[static_cast<size_t>(o->ext)];
+            if (delta >= o->qty + x.reserve) {
+                remove_resting(o);
+                orders_[id] = nullptr;
+                release(o);
+                return true;
+            }
+            Level& lvl = level_of(o);
+            Qty from_reserve = (delta < x.reserve) ? delta : x.reserve;
+            x.reserve  -= from_reserve;
+            lvl.hidden -= from_reserve;
+            Qty rest_delta = delta - from_reserve;
+            lvl.total -= rest_delta;
+            o->qty    -= rest_delta;
+            return true;
+        }
         if (delta >= o->qty) {
             remove_resting(o);
             orders_[id] = nullptr;
-            pool_.free(o);
+            release(o);
             return true;
         }
         level_of(o).total -= delta;
@@ -379,33 +463,62 @@ private:
         if (new_qty == 0) return cancel_impl(id);
         if (!in_band(new_price)) return false;
 
-        if (new_price == o->price && new_qty <= o->qty) {
-            // In-place amend down: keeps time priority.
-            Qty delta = o->qty - new_qty;
-            level_of(o).total -= delta;
-            o->qty = new_qty;
-            return true;
+        // For icebergs `new_qty` means the new *total* (displayed +
+        // hidden), mirroring how the order was submitted.
+        Qty cur_total = o->qty;
+        Qty peak = 0;
+        if (o->flags & kIceberg) [[unlikely]] {
+            const Extra& x = extras_[static_cast<size_t>(o->ext)];
+            cur_total += x.reserve;
+            peak = x.peak;
+        }
+
+        if (new_price == o->price && new_qty <= cur_total) {
+            // In-place amend down: keeps time priority. Icebergs shave
+            // reserve first, same as reduce().
+            return do_reduce(id, cur_total - new_qty);
         }
         // Cancel-replace: loses priority, may match on re-entry. Emit the
         // cancel/accept pair so the event stream reflects the semantics --
         // the old resting order is gone and a new one (same id) is accepted,
         // mirroring submit_limit, which fires on_accept before it matches.
-        // Owner and STP policy carry over to the re-entry match.
+        // Owner, STP policy, and iceberg peak carry over to the re-entry.
         Side side = o->side;
         OwnerId owner = o->owner;
         StpPolicy stp = static_cast<StpPolicy>(o->flags & kStpMask);
         remove_resting(o);
         orders_[id] = nullptr;
-        pool_.free(o);
+        release(o);
         emit_cancel(id);
         emit_accept(id, side, new_price, new_qty);
-        place_limit(id, side, new_price, new_qty, TimeInForce::GTC, owner, stp);
+        place_limit(id, side, new_price, new_qty, TimeInForce::GTC, owner, stp,
+                    peak);
         return true;
     }
 
     // --- internals -------------------------------------------------------
 
-    static constexpr uint8_t kStpMask = 0x3;  // Order::flags bits 0-1
+    static constexpr uint8_t kStpMask = 0x3;      // Order::flags bits 0-1
+    static constexpr uint8_t kIceberg = 1 << 2;   // Order::flags bit 2
+
+    int32_t alloc_extra() {
+        if (extra_free_.empty()) {
+            extras_.emplace_back();
+            return static_cast<int32_t>(extras_.size() - 1);
+        }
+        int32_t i = extra_free_.back();
+        extra_free_.pop_back();
+        return i;
+    }
+
+    // Return a node (and its cold side-state, if any) to the pools.
+    void release(Order* o) noexcept {
+        if (o->ext >= 0) {
+            extras_[static_cast<size_t>(o->ext)] = Extra{};
+            extra_free_.push_back(o->ext);
+        }
+        pool_.free(o);
+    }
 
     bool in_band(Price p) const noexcept {
         return p >= min_ && p < min_ + static_cast<Price>(n_levels_);
@@ -431,10 +544,11 @@ private:
     // it; a PostOnly reaching here cannot cross (caller kills it
     // otherwise), so it rests in full. An STP halt cancels the remainder
     // outright -- it must not rest, or the next opposite-side own order
-    // would face it again.
+    // would face it again. A nonzero `peak` rests the remainder as an
+    // iceberg: min(peak, remainder) displayed, the rest hidden.
     void place_limit(OrderId id, Side side, Price price, Qty qty,
                      TimeInForce tif = TimeInForce::GTC, OwnerId owner = 0,
-                     StpPolicy stp = StpPolicy::CancelTaker) {
+                     StpPolicy stp = StpPolicy::CancelTaker, Qty peak = 0) {
         int64_t limit_idx = static_cast<int64_t>(idx(price));
         Qty remaining = (side == Side::Buy)
             ? match_buy(id, qty, limit_idx, owner, stp)
@@ -448,7 +562,7 @@ private:
             if (tif == TimeInForce::IOC || tif == TimeInForce::FOK)
                 emit_cancel(id);
             else
-                rest(id, side, price, remaining, owner, stp);
+                rest(id, side, price, remaining, owner, stp, peak);
         }
     }
 
@@ -459,19 +573,25 @@ private:
             : (best_bid_ >= 0 && min_ + best_bid_ >= price);
     }
 
-    // Resting qty on the opposite side priced at-or-better than `price`,
-    // capped at `want`: the scan stops as soon as enough is found.
+    // Executable qty on the opposite side priced at-or-better than `price`,
+    // capped at `want`: the scan stops as soon as enough is found. Hidden
+    // iceberg reserve is executable, so it counts (FOK sees the whole
+    // book, not just the displayed clips).
     Qty fillable(Side side, Price price, Qty want) const noexcept {
         int64_t limit = static_cast<int64_t>(idx(price));
         Qty sum = 0;
         if (side == Side::Buy) {
             for (int64_t i = best_ask_; i >= 0 && i <= limit && sum < want;
-                 i = ask_map_.find_ge(i + 1))
-                sum += asks_[static_cast<size_t>(i)].total;
+                 i = ask_map_.find_ge(i + 1)) {
+                const Level& lvl = asks_[static_cast<size_t>(i)];
+                sum += lvl.total + lvl.hidden;
+            }
         } else {
             for (int64_t i = best_bid_; i >= 0 && i >= limit && sum < want;
-                 i = bid_map_.find_le(i - 1))
-                sum += bids_[static_cast<size_t>(i)].total;
+                 i = bid_map_.find_le(i - 1)) {
+                const Level& lvl = bids_[static_cast<size_t>(i)];
+                sum += lvl.total + lvl.hidden;
+            }
         }
         return sum;
     }
@@ -511,10 +631,12 @@ private:
     Order* cancel_head(Level& lvl, Order* o) {
         Order* next = o->next;
         lvl.total -= o->qty;
+        if (o->flags & kIceberg)
+            lvl.hidden -= extras_[static_cast<size_t>(o->ext)].reserve;
         --lvl.count;
         orders_[o->id] = nullptr;
         emit_cancel(o->id);
-        pool_.free(o);
+        release(o);
         lvl.head = next;
         if (next) next->prev = nullptr;
         else      lvl.tail = nullptr;
@@ -523,7 +645,9 @@ private:
 
     // Fill resting orders at one level FIFO. Returns taker qty remaining.
     // Sets stp_halt_ (and stops) if self-trade prevention says the taker
-    // may not continue.
+    // may not continue. An iceberg whose displayed clip is exhausted
+    // replenishes from reserve and moves to the back of the level, so the
+    // taker meets everyone else at the level before the next clip.
     Qty sweep_level(Level& lvl, OrderId taker, Qty qty, Price px,
                     Side taker_side, OwnerId taker_owner, StpPolicy stp) {
         Order* o = lvl.head;
@@ -540,9 +664,30 @@ private:
             qty       -= fill;
             emit_trade(Trade{taker, o->id, px, fill, taker_side});
             if (o->qty == 0) {
+                if (o->flags & kIceberg) [[unlikely]] {
+                    Extra& x = extras_[static_cast<size_t>(o->ext)];
+                    if (x.reserve > 0) {
+                        Qty clip = (x.peak < x.reserve) ? x.peak : x.reserve;
+                        x.reserve  -= clip;
+                        o->qty      = clip;
+                        lvl.total  += clip;
+                        lvl.hidden -= clip;
+                        if (o->next) {  // requeue behind the others
+                            lvl.head = o->next;
+                            lvl.head->prev = nullptr;
+                            o->prev = lvl.tail;
+                            o->next = nullptr;
+                            lvl.tail->next = o;
+                            lvl.tail = o;
+                            o = lvl.head;
+                        }
+                        // alone at the level: stays put, keep sweeping it
+                        continue;
+                    }
+                }
                 Order* next = o->next;
                 orders_[o->id] = nullptr;
-                pool_.free(o);
+                release(o);
                 --lvl.count;
                 o = next;
                 lvl.head = o;
@@ -554,14 +699,25 @@ private:
     }
 
     void rest(OrderId id, Side side, Price price, Qty qty, OwnerId owner,
-              StpPolicy stp) {
+              StpPolicy stp, Qty peak = 0) {
         Order* o = pool_.alloc();
         o->id = id; o->price = price; o->qty = qty; o->side = side;
         o->owner = owner; o->flags = static_cast<uint8_t>(stp);
+        o->ext = -1;
         o->prev = nullptr; o->next = nullptr;
 
         size_t i = idx(price);
         Level& lvl = (side == Side::Buy ? bids_ : asks_)[i];
+        if (peak != 0 && qty > peak) {
+            // Iceberg shape: show one clip, hide the rest.
+            o->flags |= kIceberg;
+            o->ext = alloc_extra();
+            Extra& x = extras_[static_cast<size_t>(o->ext)];
+            x.reserve = qty - peak;
+            x.peak = peak;
+            o->qty = peak;
+            lvl.hidden += x.reserve;
+        }
         if (lvl.tail) {
             lvl.tail->next = o;
             o->prev = lvl.tail;
@@ -578,7 +734,7 @@ private:
                     best_ask_ = static_cast<int64_t>(i);
             }
         }
-        lvl.total += qty;
+        lvl.total += o->qty;   // displayed only; reserve went to lvl.hidden
         ++lvl.count;
         orders_[id] = o;
     }
@@ -591,6 +747,8 @@ private:
         if (o->prev) o->prev->next = o->next; else lvl.head = o->next;
         if (o->next) o->next->prev = o->prev; else lvl.tail = o->prev;
         lvl.total -= o->qty;
+        if (o->flags & kIceberg)
+            lvl.hidden -= extras_[static_cast<size_t>(o->ext)].reserve;
         --lvl.count;
         if (lvl.head == nullptr) {
             if (o->side == Side::Buy) {
@@ -613,6 +771,8 @@ private:
     int64_t best_ask_ = -1;
     Pool<Order> pool_;
     std::vector<Order*> orders_;  // id -> node (nullptr if gone/never rested)
+    std::vector<Extra> extras_;   // cold side-state (icebergs, stops)
+    std::vector<int32_t> extra_free_;
     Handler& h_;
     std::vector<Event> queue_;    // deferred-mode event buffer (unused if !DeferEvents)
     int depth_ = 0;               // re-entrancy nesting depth (see Session)
