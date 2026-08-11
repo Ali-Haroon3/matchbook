@@ -15,11 +15,24 @@ enum class Side : uint8_t { Buy = 0, Sell = 1 };
 // GTC: match, rest the remainder (default).
 // IOC: match, cancel the remainder instead of resting it.
 // FOK: fill the entire quantity immediately or execute nothing at all.
-enum class TimeInForce : uint8_t { GTC = 0, IOC = 1, FOK = 2 };
+// PostOnly: rest without ever taking liquidity; killed if it would cross.
+enum class TimeInForce : uint8_t { GTC = 0, IOC = 1, FOK = 2, PostOnly = 3 };
 
 inline Side opposite(Side s) noexcept {
     return s == Side::Buy ? Side::Sell : Side::Buy;
 }
+
+// Participant id for self-trade prevention. 0 means "no owner": such
+// orders never trigger STP, so the feature is free unless opted into.
+using OwnerId = uint16_t;
+
+// What to do when an incoming order would trade against a resting order
+// with the same (nonzero) owner. The policy travels with the incoming
+// order; the maker's own policy is irrelevant (exchange convention).
+//   CancelTaker: stop matching, cancel the incoming remainder.
+//   CancelMaker: cancel the resting order, keep matching.
+//   CancelBoth:  cancel the resting order and the incoming remainder.
+enum class StpPolicy : uint8_t { CancelTaker = 0, CancelMaker = 1, CancelBoth = 2 };
 
 // Emitted once per fill. `maker` is the resting order, `taker` the incoming one.
 struct Trade {

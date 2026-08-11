@@ -3,6 +3,9 @@
 A low-latency limit order book and matching engine in C++20, with a Nasdaq
 ITCH 5.0 feed handler, a lock-free SPSC pipeline between the feed and
 matching threads, and an Avellaneda-Stoikov market-making layer on top.
+The engine speaks the full exchange order-type zoo -- IOC/FOK/post-only,
+icebergs, stops and stop-limits, self-trade prevention -- and runs call
+auctions with an equilibrium-price uncross next to continuous trading.
 
 Zero external dependencies. Header-only core. Builds clean with
 `-Wall -Wextra -Wpedantic -Wshadow` and runs clean under ASAN + UBSAN.
@@ -71,6 +74,21 @@ consecutive allocations are cache-adjacent.
 sequential, so `id -> Order*` is a vector index, not a hash. Cancel and
 modify are one indirection.
 
+**48-byte nodes, cold state off to the side.** Owner, flags, and a side-
+table index ride in what used to be node padding (a `static_assert`
+holds the line at 48 bytes). Order types that need more -- an iceberg's
+reserve and peak, a stop-limit's post-trigger price -- keep it in a
+pooled side table that plain limits never touch, so the common path's
+cache density is unchanged by the exotic order types existing.
+
+**Stop books mirror the price books.** Pending stops live in per-side
+flat Level arrays + occupancy bitmaps keyed by trigger price (allocated
+lazily; engines that never see a stop pay nothing), so "which stop does
+this print arm next" is the same masked bitmap scan as best-price
+recovery, and triggering pops FIFO from the level head. After every
+operation the engine pumps triggers to fixpoint -- a stop run is a loop,
+not a recursion, and it behaves identically under deferred events.
+
 **Compile-time event handler policy.** The engine is templated on a
 `Handler` (accept/trade/cancel/reject callbacks). No virtual dispatch, no
 `std::function`, and a no-op handler compiles to nothing.
@@ -105,11 +123,34 @@ without losing queue position.
 | Operation       | Behavior                                                        |
 |-----------------|-----------------------------------------------------------------|
 | `submit_limit`  | Matches while crossed (price-time priority, executes at the resting order's price), rests the remainder |
-| &nbsp;&nbsp;`IOC` / `FOK` | IOC cancels the unfilled remainder instead of resting it; FOK pre-checks depth at-or-better than the limit (bitmap hop over level totals) and fills completely or executes nothing |
+| &nbsp;&nbsp;`IOC` / `FOK` | IOC cancels the unfilled remainder instead of resting it; FOK pre-checks executable depth at-or-better than the limit (bitmap hop over level totals, hidden reserve included) and fills completely or executes nothing |
+| &nbsp;&nbsp;`PostOnly` | Never takes liquidity: killed on entry if it would lock or cross the opposite side, otherwise rests like GTC |
+| `submit_iceberg` | Rests showing at most `display`; an exhausted clip replenishes from the hidden reserve and re-queues at the back of the level (each clip earns its own time priority). Depth shows displayed qty only |
+| `submit_stop` / `submit_stop_limit` | Parked off-book until the last trade reaches the trigger (buy: `last >= stop`, sell: `last <= stop`), then a market order / GTC limit. Cascades run to fixpoint: one stop's fills can arm the next, buy stops firing in ascending trigger order, sell stops descending |
 | `submit_market` | Matches until filled or book exhausted; remainder is discarded  |
-| `cancel`        | O(1) by id                                                      |
-| `modify`        | Amend-down in place keeps priority; reprice/upsize is cancel-replace |
+| `cancel`        | O(1) by id; works on resting orders and pending stops alike     |
+| `modify`        | Amend-down in place keeps priority (icebergs shave reserve first); reprice/upsize is cancel-replace and keeps owner, STP policy, and iceberg peak |
 | `reduce`        | Feed-driven partial fill/cancel, keeps priority                 |
+
+Every submit takes an optional participant `owner` (nonzero arms
+**self-trade prevention**) and an `StpPolicy` carried by the incoming
+order: `CancelTaker` (default) stops the match and kills the incoming
+remainder, `CancelMaker` cancels the stale resting order and keeps
+matching, `CancelBoth` does both. Anonymous flow (`owner == 0`) pays one
+loop-invariant compare per fill for the feature's existence.
+
+**Auctions.** `halt()` opens a call phase: GTC limits and icebergs
+accumulate without matching (the book may cross), IOC/FOK/post-only are
+killed on entry, market orders are rejected, stops park without
+triggering. `uncross()` clears the overlap at a single equilibrium price
+-- maximum executed volume, ties broken by least imbalance, then
+proximity to the last trade, then the lowest price -- filling both sides
+in price-time priority with hidden reserve participating in full.
+`resume()` returns to continuous trading and fires whatever stops the
+opening prints armed. `top_levels()` / `visit_levels()` provide
+best-first aggregated depth (price, displayed qty, order count) for
+market-data publication; `hidden_at()`, `stop_depth_at()`,
+`pending_stops()`, and `last_trade()` expose the rest of the state.
 
 ## Build and run
 
@@ -147,12 +188,23 @@ e = mb.Engine(1, 10000)
 e.submit_limit(mb.Side.Sell, 100, 5)
 e.submit_limit(mb.Side.Buy, 100, 8, mb.TimeInForce.IOC)
 e.take_trades()   # [Trade(taker=2, maker=1, price=100, qty=5)]
+
+e.submit_iceberg(mb.Side.Sell, 101, 500, 25)     # 25 lit, 475 dark
+e.submit_stop(mb.Side.Buy, 103, 50)              # fires when 103 prints
+e.submit_limit(mb.Side.Buy, 101, 8, owner=7)     # self-trade prevented
+e.top_levels(mb.Side.Sell, 5)                    # [LevelView(...), ...]
+
+e.halt(); e.submit_limit(mb.Side.Buy, 102, 30)   # call phase
+e.uncross(); e.resume()                          # opening cross
 ```
 
-The module exposes the engine (submit/cancel/modify/reduce, book state,
-a drainable trade list), the Avellaneda-Stoikov quoter, and the
-Q-learning quoter — enough to drive backtests or train policies from
-Python. `tests/test_bindings.py` is the smoke test; CI runs it.
+The module exposes the engine (submit/cancel/modify/reduce across the
+full order-type zoo, self-trade prevention, auctions, book and stop-book
+state, drainable trade and cancel lists), the Avellaneda-Stoikov quoter,
+and the Q-learning quoter — enough to drive backtests or train policies
+from Python. `tests/test_bindings.py` is the smoke test; CI runs it. An
+installed pybind11 (`pip install pybind11`) is preferred over the
+FetchContent fallback, so offline builds work too.
 
 ### Replaying real Nasdaq data
 
@@ -181,6 +233,29 @@ address argument selects the NIC, as production multicast feeds do;
 `127.0.0.1` runs the whole loop on loopback, where the received book is
 bit-identical to the file replay's. A receiver that misses the
 end-of-session packet exits after 5s of feed silence instead of hanging.
+
+## Order entry (OUCH-style)
+
+`ouch.hpp` is the client-facing counterpart to the ITCH side: an
+OUCH 4.2-shaped binary order-entry protocol (fixed-width big-endian
+fields, one-letter types, 14-byte space-padded client tokens that are
+single-use for the session) plus a session `Gateway` that wires the
+message stream to an engine. Enter/Replace/Cancel go in;
+Accepted/Executed/Canceled/Replaced/Rejected come out, one byte vector
+per message — exactly the shape `mold::encode` takes, so gating OUCH
+responses onto a MoldUDP64 wire is one call.
+
+The gateway enforces the protocol's session rules rather than leaving
+them to the engine: token reuse (including a replaced-away or dead
+token) is rejected, a replace binds its new token before re-entry so
+fills print under it — with the Replaced ack inserted ahead of them in
+the outbound stream — and cancels carry a reason (user-requested,
+killed-on-entry for IOC/FOK/post-only/STP kills, self-trade for STP
+removals of resting orders). Both sides of a fill get an Executed with
+a shared match number. Deviations from Nasdaq's spec are deliberate and
+documented in the header: 8-byte signed tick prices, the engine's TIF
+enum, and Enter carrying display/owner/STP so icebergs and self-trade
+prevention are reachable over the wire.
 
 ## Market-making layer
 
@@ -223,23 +298,43 @@ mostly because it also learns to quote tighter than the closed form
 `tests/test_engine.cpp` covers price-time priority, execution at the
 maker's price, partial fills, market-order sweep and remainder discard,
 cancel edge cases, amend-vs-replace priority semantics and the
-cancel-replace event pair, modifies that cross the book, IOC/FOK
-time-in-force, band rejection, a rejected feed replace keeping its order
-reachable, the bitmap, MoldUDP64 framing (round trip, control packets,
-malformed input, gap tracking), the ring, and the Q-learning quoter
-(bucketing bounds, update math, uncrossed quotes), and the re-entrant
-engine (event-tape parity with the default mode, a handler that cancels
-the maker from inside on_trade, a handler that re-submits from a fill),
-plus a 200k-op randomized fuzz (limits, cancels, markets, IOC/FOK) — run
-against both the default and deferred-event engines — that asserts book
-invariants (never locked or crossed, consistent open-order accounting)
-after every operation. CI runs the suite in Release and under ASAN + UBSAN.
+cancel-replace event pair, modifies that cross the book, IOC/FOK and
+post-only time-in-force, self-trade prevention (all three policies,
+markets, an FOK truncated by STP, policy surviving cancel-replace),
+icebergs (clip replenishment and re-queue priority, hidden-inclusive FOK,
+reserve-first reduce/amend, peak surviving reprice), stops (pending
+visibility, trigger-on-entry, stop-limits resting their remainder,
+cascade chains, ascending/descending fire order, cancel-only lifecycle),
+auctions (call-phase accumulation, the equilibrium tie-break ladder,
+iceberg participation, stops arming off the opening print, unbalanced
+crosses), the depth snapshot, band rejection, a rejected feed replace
+keeping its order reachable, the bitmap, MoldUDP64 framing (round trip,
+control packets, malformed input, gap tracking), the OUCH codec and
+gateway (round trips, token lifecycle, replace-ack ordering ahead of
+re-entry fills, cancel reasons, STP and icebergs over the wire, framing
+outbound into Mold), the ring, and the
+Q-learning quoter (bucketing bounds, update math, uncrossed quotes), and
+the re-entrant engine (event-tape parity with the default mode, a handler
+that cancels the maker from inside on_trade, a handler that re-submits
+from a fill), plus two randomized fuzzes — run against both the default
+and deferred-event engines — throwing the full order-type zoo at the
+book (200k ops) and driving halt/uncross/resume cycles under random flow
+(60k ops), asserting the book is never locked or crossed and the
+accounting comes out clean after every operation. CI runs the suite in
+Release and under ASAN + UBSAN.
 
 ## Roadmap
 
 - ~~Live multicast replay tool (UDP receiver over the MoldUDP64 codec)~~ done: `tools/mcast_main.cpp`
 - ~~RL market-making agent trained against the simulator (AS as the baseline)~~ done: `strategy/rl_quoter.hpp`
 - ~~pybind11 bindings for research/backtest workflows~~ done: `bindings/py_matchbook.cpp` (opt-in, `-DMATCHBOOK_PYTHON=ON`)
+- ~~Post-only time-in-force~~ done: `TimeInForce::PostOnly`
+- ~~Self-trade prevention (cancel-taker / cancel-maker / cancel-both)~~ done: per-order `owner` + `StpPolicy`
+- ~~Iceberg orders with hidden reserve~~ done: `submit_iceberg`
+- ~~Stop and stop-limit orders with cascading triggers~~ done: `submit_stop`, `submit_stop_limit`
+- ~~Call auctions: halt / equilibrium-price uncross / resume~~ done: `halt()`, `uncross()`, `resume()`
+- ~~L2 depth snapshots with per-level order counts~~ done: `top_levels()`, `visit_levels()`
+- ~~OUCH-style binary order entry with a token-tracking session gateway~~ done: `ouch.hpp`
 
 ## License
 

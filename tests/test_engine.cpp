@@ -11,6 +11,7 @@
 #include "matchbook/itch_book_builder.hpp"
 #include "matchbook/matching_engine.hpp"
 #include "matchbook/mold_udp64.hpp"
+#include "matchbook/ouch.hpp"
 #include "matchbook/spsc_ring.hpp"
 #include "matchbook/level_bitmap.hpp"
 #include "matchbook/strategy/rl_quoter.hpp"
@@ -262,6 +263,36 @@ static void test_fok() {
     CHECK(!e.has_bid());
 }
 
+static void test_post_only() {
+    Recorder r;
+    Engine e(1, 10000, r);
+    e.submit_limit(Side::Sell, 100, 5);
+
+    // Would cross (or even just lock) the ask: killed, book untouched.
+    OrderId kill = e.submit_limit(Side::Buy, 100, 5, TimeInForce::PostOnly);
+    CHECK(r.trades.empty());
+    CHECK(r.cancels.size() == 1 && r.cancels[0] == kill);
+    CHECK(!e.has_bid());
+    CHECK(e.depth_at(Side::Sell, 100) == 5);
+    CHECK(!e.cancel(kill));                    // killed order is gone
+    OrderId thru = e.submit_limit(Side::Buy, 103, 5, TimeInForce::PostOnly);
+    CHECK(r.cancels.back() == thru && !e.has_bid());
+
+    // Passive price: rests exactly like GTC, cancellable, can later trade.
+    OrderId rest = e.submit_limit(Side::Buy, 99, 7, TimeInForce::PostOnly);
+    CHECK(e.has_bid() && e.best_bid() == 99);
+    CHECK(e.depth_at(Side::Buy, 99) == 7);
+    e.submit_limit(Side::Sell, 99, 7);
+    CHECK(r.trades.size() == 1 && r.trades[0].maker == rest);
+
+    // Empty opposite side: nothing to cross, rests.
+    Recorder r2;
+    Engine e2(1, 10000, r2);
+    OrderId sell = e2.submit_limit(Side::Sell, 105, 3, TimeInForce::PostOnly);
+    CHECK(e2.has_ask() && e2.best_ask() == 105);
+    CHECK(e2.cancel(sell));
+}
+
 static void test_band_rejection() {
     Recorder r;
     Engine e(100, 200, r);
@@ -269,6 +300,584 @@ static void test_band_rejection() {
     CHECK(e.submit_limit(Side::Buy, 201, 5) == kInvalidOrderId);
     CHECK(e.submit_limit(Side::Buy, 100, 5) != kInvalidOrderId);
     CHECK(e.submit_limit(Side::Sell, 200, 5) != kInvalidOrderId);
+}
+
+static void test_self_trade_prevention() {
+    // CancelTaker (default): the incoming order stops dead at its own
+    // resting order and its remainder is cancelled; the maker stays.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId mine = e.submit_limit(Side::Sell, 100, 5, TimeInForce::GTC, 7);
+        OrderId taker = e.submit_limit(Side::Buy, 100, 8, TimeInForce::GTC, 7);
+        CHECK(r.trades.empty());
+        CHECK(r.cancels.size() == 1 && r.cancels[0] == taker);
+        CHECK(e.depth_at(Side::Sell, 100) == 5);
+        CHECK(!e.has_bid());                       // remainder must not rest
+        CHECK(e.cancel(mine));
+    }
+    // Other people's orders ahead of mine still trade; the halt happens
+    // only when the sweep reaches the same-owner order.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId theirs = e.submit_limit(Side::Sell, 100, 4, TimeInForce::GTC, 9);
+        OrderId mine = e.submit_limit(Side::Sell, 100, 5, TimeInForce::GTC, 7);
+        e.submit_limit(Side::Buy, 100, 10, TimeInForce::GTC, 7);
+        CHECK(r.trades.size() == 1 && r.trades[0].maker == theirs);
+        CHECK(r.trades[0].qty == 4);
+        CHECK(e.depth_at(Side::Sell, 100) == 5);   // mine untouched
+        CHECK(!e.has_bid());
+        CHECK(e.cancel(mine));
+    }
+    // CancelMaker: my stale resting order is cancelled and the incoming
+    // order keeps matching through it, across levels.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId mine = e.submit_limit(Side::Sell, 100, 5, TimeInForce::GTC, 7);
+        OrderId theirs = e.submit_limit(Side::Sell, 101, 6, TimeInForce::GTC, 9);
+        OrderId in = e.submit_limit(Side::Buy, 101, 6, TimeInForce::GTC, 7,
+                                    StpPolicy::CancelMaker);
+        CHECK(r.cancels.size() == 1 && r.cancels[0] == mine);
+        CHECK(r.trades.size() == 1 && r.trades[0].maker == theirs);
+        CHECK(r.trades[0].qty == 6 && r.trades[0].taker == in);
+        CHECK(!e.has_ask() && !e.has_bid());
+        CHECK(e.open_orders() == 0);
+    }
+    // CancelBoth: resting order cancelled, incoming remainder cancelled.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId mine = e.submit_limit(Side::Sell, 100, 5, TimeInForce::GTC, 7);
+        e.submit_limit(Side::Sell, 101, 6, TimeInForce::GTC, 9);
+        OrderId in = e.submit_limit(Side::Buy, 101, 8, TimeInForce::GTC, 7,
+                                    StpPolicy::CancelBoth);
+        CHECK(r.trades.empty());
+        CHECK(r.cancels.size() == 2);
+        CHECK(r.cancels[0] == mine && r.cancels[1] == in);
+        CHECK(e.depth_at(Side::Sell, 101) == 6);   // the stranger survives
+        CHECK(!e.has_bid());
+    }
+    // Owner 0 never triggers STP -- anonymous flow can self-cross.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 5);
+        e.submit_limit(Side::Buy, 100, 5);
+        CHECK(r.trades.size() == 1);
+    }
+    // Market order + STP: stops at the own order, remainder reported
+    // unfilled, book left intact behind the halt.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 3, TimeInForce::GTC, 9);
+        e.submit_limit(Side::Sell, 101, 5, TimeInForce::GTC, 7);
+        e.submit_limit(Side::Sell, 102, 5, TimeInForce::GTC, 9);
+        Qty rem = e.submit_market(Side::Buy, 10, 7);
+        CHECK(rem == 7);                           // 3 filled, then halt
+        CHECK(r.trades.size() == 1 && r.trades[0].qty == 3);
+        CHECK(e.depth_at(Side::Sell, 101) == 5);
+        CHECK(e.depth_at(Side::Sell, 102) == 5);
+    }
+    // FOK whose feasibility was met only by own liquidity: STP halts the
+    // fill mid-way and cancels the remainder (documented interaction).
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 4, TimeInForce::GTC, 9);
+        e.submit_limit(Side::Sell, 101, 6, TimeInForce::GTC, 7);
+        OrderId fok = e.submit_limit(Side::Buy, 101, 10, TimeInForce::FOK, 7);
+        CHECK(r.trades.size() == 1 && r.trades[0].qty == 4);
+        CHECK(r.cancels.back() == fok);
+        CHECK(!e.has_bid());
+    }
+    // Cancel-replace keeps owner and policy: repricing my bid through my
+    // own ask still refuses to self-trade.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ask = e.submit_limit(Side::Sell, 105, 5, TimeInForce::GTC, 7);
+        OrderId bid = e.submit_limit(Side::Buy, 100, 5, TimeInForce::GTC, 7);
+        CHECK(e.modify(bid, 105, 5));              // would cross own ask
+        CHECK(r.trades.empty());
+        CHECK(e.depth_at(Side::Sell, 105) == 5);   // maker untouched
+        CHECK(!e.has_bid());                       // replaced bid was killed
+        CHECK(e.cancel(ask));
+    }
+}
+
+static void test_iceberg() {
+    // Resting shape: display clip visible, reserve hidden, one order.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Sell, 100, 25, 10);
+        CHECK(e.best_ask() == 100);
+        CHECK(e.depth_at(Side::Sell, 100) == 10);
+        CHECK(e.hidden_at(Side::Sell, 100) == 15);
+        CHECK(e.order_count_at(Side::Sell, 100) == 1);
+        auto top = e.top_levels(Side::Sell, 3);
+        CHECK(top.size() == 1 && top[0].qty == 10);
+
+        // A lone iceberg refills clip after clip against one taker:
+        // 10 + 10 + 5, three prints against the same maker.
+        e.submit_limit(Side::Buy, 100, 25);
+        CHECK(r.trades.size() == 3);
+        CHECK(r.trades[0].qty == 10 && r.trades[0].maker == ice);
+        CHECK(r.trades[1].qty == 10 && r.trades[1].maker == ice);
+        CHECK(r.trades[2].qty == 5 && r.trades[2].maker == ice);
+        CHECK(!e.has_ask() && !e.has_bid());
+        CHECK(e.open_orders() == 0);
+    }
+    // Replenished clips lose time priority: after the first clip fills,
+    // the order behind at the level trades before the next clip.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Sell, 100, 10, 5);
+        OrderId behind = e.submit_limit(Side::Sell, 100, 3);
+        e.submit_limit(Side::Buy, 100, 10);
+        CHECK(r.trades.size() == 3);
+        CHECK(r.trades[0].maker == ice && r.trades[0].qty == 5);
+        CHECK(r.trades[1].maker == behind && r.trades[1].qty == 3);
+        CHECK(r.trades[2].maker == ice && r.trades[2].qty == 2);
+        CHECK(e.depth_at(Side::Sell, 100) == 3);   // clip remainder shows
+        CHECK(e.hidden_at(Side::Sell, 100) == 0);
+        CHECK(e.order_count_at(Side::Sell, 100) == 1);
+    }
+    // Crossing on entry: aggressive part executes for full size, only the
+    // remainder rests dark.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 5);
+        e.submit_iceberg(Side::Buy, 100, 12, 4);
+        CHECK(r.trades.size() == 1 && r.trades[0].qty == 5);
+        CHECK(e.depth_at(Side::Buy, 100) == 4);
+        CHECK(e.hidden_at(Side::Buy, 100) == 3);
+    }
+    // FOK feasibility counts hidden reserve.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_iceberg(Side::Sell, 100, 30, 5);
+        OrderId fok = e.submit_limit(Side::Buy, 100, 25, TimeInForce::FOK);
+        CHECK(r.trades.size() == 5);               // 5 clips of 5
+        CHECK(r.cancels.empty());
+        Qty sum = 0;
+        for (auto& t : r.trades) { sum += t.qty; CHECK(t.taker == fok); }
+        CHECK(sum == 25);
+        CHECK(e.depth_at(Side::Sell, 100) == 5);   // 30 - 25 left showing
+        CHECK(e.hidden_at(Side::Sell, 100) == 0);
+    }
+    // Cancel removes displayed and hidden alike.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Buy, 90, 40, 8);
+        e.submit_limit(Side::Sell, 90, 3);          // nibble the clip
+        CHECK(e.depth_at(Side::Buy, 90) == 5);
+        CHECK(e.cancel(ice));
+        CHECK(!e.has_bid());
+        CHECK(e.hidden_at(Side::Buy, 90) == 0);
+        CHECK(e.open_orders() == 0);
+    }
+    // reduce() shaves the reserve first, keeping the clip and priority.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Sell, 100, 20, 6);
+        CHECK(e.reduce(ice, 8));                    // 12 left: 6 shown, 6 dark
+        CHECK(e.depth_at(Side::Sell, 100) == 6);
+        CHECK(e.hidden_at(Side::Sell, 100) == 6);
+        CHECK(e.reduce(ice, 8));                    // 4 left: all shown
+        CHECK(e.depth_at(Side::Sell, 100) == 4);
+        CHECK(e.hidden_at(Side::Sell, 100) == 0);
+        CHECK(e.reduce(ice, 4));                    // gone
+        CHECK(!e.has_ask() && e.open_orders() == 0);
+    }
+    // modify(): qty means new total. Amend-down keeps priority; reprice
+    // is cancel-replace but stays an iceberg with the same peak.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Sell, 100, 20, 6);
+        OrderId behind = e.submit_limit(Side::Sell, 100, 5);
+        CHECK(e.modify(ice, 100, 10));              // shave: 6 shown, 4 dark
+        CHECK(e.depth_at(Side::Sell, 100) == 11);
+        CHECK(e.hidden_at(Side::Sell, 100) == 4);
+        e.submit_limit(Side::Buy, 100, 6);
+        CHECK(r.trades[0].maker == ice);            // priority kept
+
+        CHECK(e.modify(ice, 101, 9));               // reprice, still iceberg
+        CHECK(e.depth_at(Side::Sell, 101) == 6);    // peak carried over
+        CHECK(e.hidden_at(Side::Sell, 101) == 3);
+        CHECK(e.depth_at(Side::Sell, 100) == 5);    // `behind` stayed
+        CHECK(e.cancel(ice) && e.cancel(behind));
+    }
+    // STP CancelMaker wipes a whole resting iceberg, hidden included.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId ice = e.submit_iceberg(Side::Sell, 100, 30, 5, TimeInForce::GTC, 7);
+        e.submit_limit(Side::Buy, 100, 3, TimeInForce::GTC, 7,
+                       StpPolicy::CancelMaker);
+        CHECK(r.trades.empty());
+        CHECK(r.cancels.size() == 1 && r.cancels[0] == ice);
+        CHECK(!e.has_ask());                        // iceberg fully gone
+        CHECK(e.hidden_at(Side::Sell, 100) == 0);
+        CHECK(e.has_bid() && e.depth_at(Side::Buy, 100) == 3);  // taker rests
+        CHECK(e.open_orders() == 1);
+    }
+    // display >= total collapses to a plain limit: nothing hidden.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_iceberg(Side::Buy, 95, 7, 50);
+        CHECK(e.depth_at(Side::Buy, 95) == 7);
+        CHECK(e.hidden_at(Side::Buy, 95) == 0);
+    }
+    // Zero display or zero qty is rejected outright.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        CHECK(e.submit_iceberg(Side::Buy, 95, 10, 0) == kInvalidOrderId);
+        CHECK(e.submit_iceberg(Side::Buy, 95, 0, 5) == kInvalidOrderId);
+    }
+}
+
+static void test_stop_orders() {
+    // A stop rests off-book until the tape reaches its trigger, then
+    // executes as a market order.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 5);
+        e.submit_limit(Side::Sell, 105, 5);
+        OrderId stop = e.submit_stop(Side::Buy, 103, 5);
+        CHECK(e.pending_stops() == 1);
+        CHECK(e.stop_depth_at(Side::Buy, 103) == 5);
+        CHECK(!e.has_bid());                        // invisible to the book
+        CHECK(e.open_orders() == 3);                // 2 resting + 1 pending
+
+        e.submit_limit(Side::Buy, 100, 5);          // prints 100 < 103: no fire
+        CHECK(e.pending_stops() == 1);
+        CHECK(r.trades.size() == 1);
+
+        e.submit_limit(Side::Buy, 105, 5);          // prints 105 >= 103: fires
+        CHECK(e.pending_stops() == 0);
+        // The stop went off as a market order but the ask side is empty
+        // now, so it discarded its quantity: trades are 100 and 105 only.
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[1].price == 105);
+        CHECK(stop != kInvalidOrderId);
+        CHECK(!e.cancel(stop));                     // consumed, not resting
+    }
+    // Trigger-on-entry: the tape is already through the stop.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 5);
+        e.submit_limit(Side::Buy, 100, 5);          // last = 100
+        e.submit_limit(Side::Sell, 104, 7);
+        OrderId stop = e.submit_stop(Side::Buy, 99, 4);   // 100 >= 99: fires now
+        CHECK(e.pending_stops() == 0);
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[1].taker == stop);
+        CHECK(r.trades[1].price == 104 && r.trades[1].qty == 4);
+    }
+    // Stop-limit: fires into a limit; the remainder rests at the limit.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 2);
+        e.submit_limit(Side::Buy, 100, 2);          // last = 100
+        e.submit_limit(Side::Sell, 104, 4);
+        OrderId sl = e.submit_stop_limit(Side::Buy, 100, 105, 10);
+        CHECK(r.trades.size() == 2);                // fired immediately
+        CHECK(r.trades[1].taker == sl && r.trades[1].price == 104);
+        CHECK(e.has_bid() && e.best_bid() == 105);  // 6 rested at the limit
+        CHECK(e.depth_at(Side::Buy, 105) == 6);
+        CHECK(e.cancel(sl));                        // now a normal resting order
+    }
+    // Cascade: one stop's fills arm the next; both fire in one pump.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 101, 5);
+        e.submit_limit(Side::Sell, 102, 5);
+        e.submit_limit(Side::Sell, 103, 5);
+        OrderId s1 = e.submit_stop(Side::Buy, 101, 5);
+        OrderId s2 = e.submit_stop(Side::Buy, 102, 5);
+        CHECK(e.pending_stops() == 2);
+        e.submit_limit(Side::Buy, 101, 5);          // print 101 arms s1
+        // s1 lifts 102 (last=102) arming s2; s2 lifts 103.
+        CHECK(e.pending_stops() == 0);
+        CHECK(r.trades.size() == 3);
+        CHECK(r.trades[1].taker == s1 && r.trades[1].price == 102);
+        CHECK(r.trades[2].taker == s2 && r.trades[2].price == 103);
+        CHECK(!e.has_ask());
+    }
+    // Multiple armed stops fire in trigger order (buy stops ascending).
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 106, 1);
+        e.submit_limit(Side::Sell, 110, 1);
+        e.submit_limit(Side::Sell, 111, 1);
+        OrderId hi = e.submit_stop(Side::Buy, 106, 1);
+        OrderId lo = e.submit_stop(Side::Buy, 103, 1);
+        e.submit_limit(Side::Buy, 106, 1);          // print 106 arms both
+        CHECK(e.pending_stops() == 0);
+        CHECK(r.trades.size() == 3);
+        CHECK(r.trades[1].taker == lo);             // ascending: 103 first
+        CHECK(r.trades[1].price == 110);
+        CHECK(r.trades[2].taker == hi);
+        CHECK(r.trades[2].price == 111);
+    }
+    // Sell stops mirror: trigger at last <= stop, descending order.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Buy, 95, 5);
+        e.submit_limit(Side::Buy, 90, 5);
+        OrderId stop = e.submit_stop(Side::Sell, 97, 5);
+        e.submit_limit(Side::Buy, 96, 1);
+        e.submit_limit(Side::Sell, 96, 1);          // print 96 <= 97: fires
+        CHECK(e.pending_stops() == 0);
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[1].taker == stop);
+        CHECK(r.trades[1].price == 95 && r.trades[1].qty == 5);
+    }
+    // Pending stops can be cancelled (and only cancelled).
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId stop = e.submit_stop_limit(Side::Sell, 90, 89, 5);
+        CHECK(e.pending_stops() == 1);
+        CHECK(!e.modify(stop, 91, 5));              // refuse modify
+        CHECK(!e.reduce(stop, 1));                  // refuse reduce
+        CHECK(e.cancel(stop));
+        CHECK(e.pending_stops() == 0 && e.open_orders() == 0);
+        CHECK(r.cancels.size() == 1 && r.cancels[0] == stop);
+        CHECK(!e.cancel(stop));
+        // modify to qty 0 is a cancel and is allowed on a pending stop.
+        OrderId stop2 = e.submit_stop(Side::Sell, 90, 5);
+        CHECK(e.modify(stop2, 90, 0));
+        CHECK(e.pending_stops() == 0);
+    }
+    // Rejections: bad qty, out-of-band trigger or limit.
+    {
+        Recorder r;
+        Engine e(100, 200, r);
+        CHECK(e.submit_stop(Side::Buy, 150, 0) == kInvalidOrderId);
+        CHECK(e.submit_stop(Side::Buy, 99, 5) == kInvalidOrderId);
+        CHECK(e.submit_stop_limit(Side::Buy, 150, 201, 5) == kInvalidOrderId);
+        CHECK(e.open_orders() == 0 && e.pending_stops() == 0);
+    }
+    // No trades yet: nothing can trigger, whatever the stop price.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_stop(Side::Buy, 1, 5);             // would be instantly armed
+        CHECK(e.pending_stops() == 1);              // ...if there were a tape
+        CHECK(!e.has_last_trade());
+    }
+}
+
+static void test_auction() {
+    // Call phase: GTC flow accumulates without matching, even crossed.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.halt();
+        CHECK(e.is_halted());
+        e.submit_limit(Side::Sell, 99, 10);
+        e.submit_limit(Side::Sell, 100, 10);
+        e.submit_limit(Side::Sell, 101, 10);
+        e.submit_limit(Side::Buy, 102, 10);
+        e.submit_limit(Side::Buy, 101, 10);
+        e.submit_limit(Side::Buy, 100, 10);
+        CHECK(r.trades.empty());
+        CHECK(e.best_bid() == 102 && e.best_ask() == 99);   // crossed, standing
+
+        // Equilibrium: exec 20 at both 100 and 101, equal imbalance; no
+        // last trade, so the tie breaks low: clears at 100.
+        Qty crossed = e.uncross();
+        CHECK(crossed == 20);
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[0].price == 100 && r.trades[1].price == 100);
+        CHECK(r.trades[0].qty == 10 && r.trades[1].qty == 10);
+        CHECK(r.trades[0].taker_side == Side::Buy);
+        CHECK(e.last_trade() == 100);
+        // Leftovers stand un-crossed: bid 10@100 vs ask 10@101.
+        CHECK(e.best_bid() == 100 && e.best_ask() == 101);
+        CHECK(e.depth_at(Side::Buy, 100) == 10);
+        CHECK(e.depth_at(Side::Sell, 101) == 10);
+
+        e.resume();
+        CHECK(!e.is_halted());
+        e.submit_limit(Side::Buy, 101, 4);                  // continuous again
+        CHECK(r.trades.size() == 3 && r.trades[2].price == 101);
+    }
+    // Same book, but a pre-halt print at 101 pulls the tie to 101.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 101, 1);
+        e.submit_limit(Side::Buy, 101, 1);                  // last = 101
+        e.halt();
+        e.submit_limit(Side::Sell, 99, 10);
+        e.submit_limit(Side::Sell, 100, 10);
+        e.submit_limit(Side::Sell, 101, 10);
+        e.submit_limit(Side::Buy, 102, 10);
+        e.submit_limit(Side::Buy, 101, 10);
+        e.submit_limit(Side::Buy, 100, 10);
+        r.trades.clear();
+        CHECK(e.uncross() == 20);
+        CHECK(r.trades[0].price == 101);
+        // Price priority preserved: best bid crossed with best ask first.
+        CHECK(r.trades[0].taker == r.trades[0].taker);      // ids exist
+        CHECK(e.best_bid() == 100 && e.best_ask() == 101);
+    }
+    // Halt kills IOC/FOK/PostOnly on entry and rejects market orders.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.submit_limit(Side::Sell, 100, 5);
+        e.halt();
+        OrderId a = e.submit_limit(Side::Buy, 100, 5, TimeInForce::IOC);
+        OrderId b = e.submit_limit(Side::Buy, 100, 5, TimeInForce::FOK);
+        OrderId c = e.submit_limit(Side::Buy, 99, 5, TimeInForce::PostOnly);
+        CHECK(r.cancels.size() == 3);
+        CHECK(r.cancels[0] == a && r.cancels[1] == b && r.cancels[2] == c);
+        CHECK(e.submit_market(Side::Buy, 5) == 5);          // rejected whole
+        CHECK(r.trades.empty());
+        CHECK(e.depth_at(Side::Sell, 100) == 5);
+        // cancel/modify still work during the call.
+        OrderId d = e.submit_limit(Side::Buy, 98, 5);
+        CHECK(e.modify(d, 100, 5));                         // reprice: rests, no match
+        CHECK(r.trades.empty());
+        CHECK(e.depth_at(Side::Buy, 100) == 5);
+        CHECK(e.cancel(d));
+        e.resume();
+    }
+    // Icebergs participate with full (hidden) size; leftovers come back
+    // renormalized to a fresh clip.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.halt();
+        e.submit_iceberg(Side::Sell, 100, 30, 5);
+        e.submit_limit(Side::Buy, 100, 12);
+        CHECK(e.uncross() == 12);
+        CHECK(r.trades.size() == 1);                        // one print, full 12
+        CHECK(r.trades[0].qty == 12 && r.trades[0].price == 100);
+        CHECK(e.depth_at(Side::Sell, 100) == 5);            // fresh clip
+        CHECK(e.hidden_at(Side::Sell, 100) == 13);          // 30-12-5
+        CHECK(!e.has_bid());
+        e.resume();
+    }
+    // Stops armed by the auction print hold through the halt and fire on
+    // resume, off the opening print.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        OrderId stop = e.submit_stop(Side::Buy, 100, 3);
+        CHECK(e.pending_stops() == 1);
+        e.halt();
+        e.submit_limit(Side::Sell, 100, 5);
+        e.submit_limit(Side::Buy, 100, 5);
+        e.submit_limit(Side::Sell, 104, 3);                 // post-open ask
+        CHECK(e.uncross() == 5);                            // prints at 100
+        CHECK(e.pending_stops() == 1);                      // still parked
+        e.resume();                                         // fires now
+        CHECK(e.pending_stops() == 0);
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[1].taker == stop);
+        CHECK(r.trades[1].price == 104 && r.trades[1].qty == 3);
+    }
+    // Uncross on a book that never crossed is a no-op returning 0; so is
+    // uncrossing while continuous (the book can't be crossed then).
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.halt();
+        e.submit_limit(Side::Buy, 99, 5);
+        e.submit_limit(Side::Sell, 101, 5);
+        CHECK(e.uncross() == 0);
+        e.resume();
+        CHECK(e.uncross() == 0);
+        CHECK(e.open_orders() == 2);
+    }
+    // Unbalanced cross: the surplus side's last order keeps its
+    // remainder, FIFO decides who among equal-priced bids gets filled.
+    {
+        Recorder r;
+        Engine e(1, 10000, r);
+        e.halt();
+        OrderId first = e.submit_limit(Side::Buy, 100, 6);
+        OrderId second = e.submit_limit(Side::Buy, 100, 6);
+        e.submit_limit(Side::Sell, 100, 8);
+        CHECK(e.uncross() == 8);
+        CHECK(r.trades.size() == 2);
+        CHECK(r.trades[0].taker == first && r.trades[0].qty == 6);
+        CHECK(r.trades[1].taker == second && r.trades[1].qty == 2);
+        CHECK(e.depth_at(Side::Buy, 100) == 4);             // second's leftover
+        CHECK(!e.has_ask());
+        e.resume();
+        CHECK(e.cancel(second));
+        CHECK(!e.cancel(first));                            // fully filled
+    }
+}
+
+static void test_depth_snapshot() {
+    Recorder r;
+    Engine e(1, 10000, r);
+
+    // Empty book: empty snapshot, zero counts.
+    CHECK(e.top_levels(Side::Buy, 5).empty());
+    CHECK(e.order_count_at(Side::Buy, 100) == 0);
+    CHECK(e.order_count_at(Side::Buy, 999999) == 0);   // out of band
+
+    e.submit_limit(Side::Buy, 100, 5);
+    e.submit_limit(Side::Buy, 100, 7);
+    e.submit_limit(Side::Buy, 98, 3);
+    OrderId b96 = e.submit_limit(Side::Buy, 96, 9);
+    e.submit_limit(Side::Sell, 105, 4);
+    e.submit_limit(Side::Sell, 106, 6);
+
+    // Bids best-first (descending), aggregated qty and per-level counts.
+    auto bids = e.top_levels(Side::Buy, 10);
+    CHECK(bids.size() == 3);
+    CHECK(bids[0].price == 100 && bids[0].qty == 12 && bids[0].orders == 2);
+    CHECK(bids[1].price == 98  && bids[1].qty == 3  && bids[1].orders == 1);
+    CHECK(bids[2].price == 96  && bids[2].qty == 9  && bids[2].orders == 1);
+
+    // Asks best-first (ascending); truncation honors max_levels.
+    auto asks = e.top_levels(Side::Sell, 1);
+    CHECK(asks.size() == 1);
+    CHECK(asks[0].price == 105 && asks[0].qty == 4 && asks[0].orders == 1);
+
+    // Counts stay consistent through fills and cancels.
+    e.submit_limit(Side::Sell, 100, 4);                  // partial fill of first
+    CHECK(e.order_count_at(Side::Buy, 100) == 2);        // both still resting
+    e.submit_limit(Side::Sell, 100, 8);                  // finishes the level
+    CHECK(e.order_count_at(Side::Buy, 100) == 0);
+    CHECK(e.cancel(b96));
+    CHECK(e.order_count_at(Side::Buy, 96) == 0);
+    auto after = e.top_levels(Side::Buy, 10);
+    CHECK(after.size() == 1 && after[0].price == 98);
+
+    // visit_levels is the zero-alloc primitive under top_levels.
+    size_t seen = 0;
+    e.visit_levels(Side::Sell, 100, [&](const LevelView& v) {
+        ++seen;
+        CHECK(v.orders == 1);
+    });
+    CHECK(seen == 2);
 }
 
 static void test_bitmap() {
@@ -354,46 +963,391 @@ static void test_mold_udp64() {
     CHECK(t.expected() == 11);
 }
 
+// Space-pad a token the way it appears on the wire.
+static std::string tok(const char* s) {
+    std::string t(s);
+    t.resize(ouch::kTokenLen, ' ');
+    return t;
+}
+
+static std::vector<ouch::OutMsg> ouch_drain(ouch::Gateway& gw) {
+    std::vector<ouch::OutMsg> v;
+    for (auto& m : gw.take_out()) {
+        ouch::OutMsg om{};
+        CHECK(ouch::decode_out(m.data(), m.size(), om));
+        v.push_back(om);
+    }
+    return v;
+}
+
+static void ouch_enter(ouch::Gateway& gw, const char* token, Side side,
+                       uint32_t qty, Price px,
+                       TimeInForce tif = TimeInForce::GTC,
+                       uint32_t display = 0, OwnerId owner = 0,
+                       StpPolicy stp = StpPolicy::CancelTaker) {
+    std::vector<uint8_t> b;
+    ouch::encode_enter(b, token, side, qty, px, tif, display, owner, stp);
+    CHECK(gw.on_message(b.data(), b.size()));
+}
+
+static void test_ouch_codec() {
+    // Inbound round trip, token space-padding included.
+    std::vector<uint8_t> b;
+    ouch::encode_enter(b, "ABC", Side::Buy, 50, -3, TimeInForce::PostOnly,
+                       7, 42, StpPolicy::CancelBoth);
+    CHECK(b.size() == ouch::kEnterSize);
+    ouch::InMsg in{};
+    CHECK(ouch::decode_in(b.data(), b.size(), in));
+    CHECK(in.type == ouch::InType::Enter);
+    CHECK(tok("ABC") == in.token);
+    CHECK(in.side == Side::Buy && in.qty == 50);
+    CHECK(in.price == -3);                       // negative survives (i64)
+    CHECK(in.tif == TimeInForce::PostOnly && in.display == 7);
+    CHECK(in.owner == 42 && in.stp == StpPolicy::CancelBoth);
+    CHECK(!ouch::decode_in(b.data(), b.size() - 1, in));   // truncated
+    b[28] = 9;                                             // bad tif byte
+    CHECK(!ouch::decode_in(b.data(), b.size(), in));
+
+    b.clear();
+    ouch::encode_replace(b, "OLD", "NEW", 9, 123);
+    CHECK(b.size() == ouch::kReplaceSize);
+    CHECK(ouch::decode_in(b.data(), b.size(), in));
+    CHECK(in.type == ouch::InType::Replace);
+    CHECK(tok("OLD") == in.token && tok("NEW") == in.new_token);
+    CHECK(in.qty == 9 && in.price == 123);
+
+    b.clear();
+    ouch::encode_cancel(b, "OLD");
+    CHECK(ouch::decode_in(b.data(), b.size(), in));
+    CHECK(in.type == ouch::InType::Cancel && tok("OLD") == in.token);
+    b[0] = 'Z';
+    CHECK(!ouch::decode_in(b.data(), b.size(), in));       // unknown type
+
+    // Outbound round trips.
+    ouch::OutMsg om{};
+    b.clear();
+    ouch::encode_accepted(b, "T1", 55, Side::Sell, 10, 999);
+    CHECK(b.size() == ouch::kAcceptedSize);
+    CHECK(ouch::decode_out(b.data(), b.size(), om));
+    CHECK(om.type == ouch::OutType::Accepted && tok("T1") == om.token);
+    CHECK(om.id == 55 && om.side == Side::Sell && om.qty == 10 &&
+          om.price == 999);
+    b.clear();
+    ouch::encode_executed(b, "T1", 4, 998, 77);
+    CHECK(ouch::decode_out(b.data(), b.size(), om));
+    CHECK(om.type == ouch::OutType::Executed && om.qty == 4 &&
+          om.price == 998 && om.match == 77);
+    b.clear();
+    ouch::encode_canceled(b, "T1", ouch::kUserRequested);
+    CHECK(ouch::decode_out(b.data(), b.size(), om));
+    CHECK(om.type == ouch::OutType::Canceled && om.reason == 'U');
+    b.clear();
+    ouch::encode_replaced(b, "T1", "T2", 55, 6, 997);
+    CHECK(b.size() == ouch::kReplacedSize);
+    CHECK(ouch::decode_out(b.data(), b.size(), om));
+    CHECK(om.type == ouch::OutType::Replaced);
+    CHECK(tok("T1") == om.token && tok("T2") == om.new_token);
+    CHECK(om.id == 55 && om.qty == 6 && om.price == 997);
+    b.clear();
+    ouch::encode_rejected(b, "T3", ouch::kBadToken);
+    CHECK(ouch::decode_out(b.data(), b.size(), om));
+    CHECK(om.type == ouch::OutType::Rejected && om.reason == 'T');
+    CHECK(!ouch::decode_out(b.data(), 3, om));             // truncated
+}
+
+static void test_ouch_gateway() {
+    using ouch::OutType;
+    // Accept, cross, both Executed under one match number, remainder rests.
+    {
+        ouch::Gateway gw(1, 10000);
+        ouch_enter(gw, "SELL1", Side::Sell, 5, 100);
+        auto v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Accepted);
+        CHECK(tok("SELL1") == v[0].token && v[0].qty == 5 && v[0].price == 100);
+
+        ouch_enter(gw, "BUY1", Side::Buy, 8, 100);
+        v = ouch_drain(gw);
+        CHECK(v.size() == 3);
+        CHECK(v[0].type == OutType::Accepted && tok("BUY1") == v[0].token);
+        CHECK(v[1].type == OutType::Executed && tok("BUY1") == v[1].token);
+        CHECK(v[2].type == OutType::Executed && tok("SELL1") == v[2].token);
+        CHECK(v[1].qty == 5 && v[2].qty == 5 && v[1].price == 100);
+        CHECK(v[1].match == v[2].match && v[1].match > 0);
+        CHECK(gw.engine().depth_at(Side::Buy, 100) == 3);
+
+        // User cancel; second cancel and token reuse are both dead-token
+        // rejects.
+        std::vector<uint8_t> b;
+        ouch::encode_cancel(b, "BUY1");
+        CHECK(gw.on_message(b.data(), b.size()));
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Canceled);
+        CHECK(v[0].reason == ouch::kUserRequested);
+        CHECK(gw.on_message(b.data(), b.size()));
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+        CHECK(v[0].reason == ouch::kBadToken);
+        ouch_enter(gw, "SELL1", Side::Sell, 1, 101);       // reuse: burned
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+        CHECK(v[0].reason == ouch::kBadToken);
+    }
+    // IOC kill and validation rejects (token not burned by a reject).
+    {
+        ouch::Gateway gw(1, 10000);
+        ouch_enter(gw, "S", Side::Sell, 4, 100);
+        ouch_drain(gw);
+        ouch_enter(gw, "B", Side::Buy, 9, 100, TimeInForce::IOC);
+        auto v = ouch_drain(gw);
+        CHECK(v.size() == 4);
+        CHECK(v[0].type == OutType::Accepted);
+        CHECK(v[1].type == OutType::Executed && v[2].type == OutType::Executed);
+        CHECK(v[3].type == OutType::Canceled && tok("B") == v[3].token);
+        CHECK(v[3].reason == ouch::kKilledOnEntry);
+
+        ouch_enter(gw, "V", Side::Buy, 0, 100);            // qty 0
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+        CHECK(v[0].reason == ouch::kValidation);
+        ouch_enter(gw, "V", Side::Buy, 5, 999999);         // out of band
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].reason == ouch::kValidation);
+        ouch_enter(gw, "V", Side::Buy, 5, 99);             // now fine
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Accepted);
+    }
+    // Replace: ack precedes re-entry executions; old token dies; failed
+    // replace leaves the original untouched under the old token.
+    {
+        ouch::Gateway gw(1, 10000);
+        ouch_enter(gw, "BUY5", Side::Buy, 6, 95);
+        ouch_enter(gw, "SELL3", Side::Sell, 10, 105);
+        ouch_drain(gw);
+
+        std::vector<uint8_t> b;
+        ouch::encode_replace(b, "SELL3", "SELL4", 6, 105); // amend down
+        CHECK(gw.on_message(b.data(), b.size()));
+        auto v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Replaced);
+        CHECK(tok("SELL3") == v[0].token && tok("SELL4") == v[0].new_token);
+        CHECK(gw.engine().depth_at(Side::Sell, 105) == 6);
+
+        b.clear();
+        ouch::encode_cancel(b, "SELL3");                   // old token dead
+        gw.on_message(b.data(), b.size());
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+
+        b.clear();
+        ouch::encode_replace(b, "SELL4", "SELL5", 6, 999999);  // bad price
+        gw.on_message(b.data(), b.size());
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+        CHECK(v[0].reason == ouch::kValidation);
+        CHECK(gw.engine().depth_at(Side::Sell, 105) == 6); // untouched
+
+        b.clear();
+        ouch::encode_replace(b, "SELL4", "SELL5", 6, 95);  // crosses BUY5
+        gw.on_message(b.data(), b.size());
+        v = ouch_drain(gw);
+        CHECK(v.size() == 3);
+        CHECK(v[0].type == OutType::Replaced);             // ack first...
+        CHECK(v[1].type == OutType::Executed);             // ...then fills
+        CHECK(tok("SELL5") == v[1].token || tok("SELL5") == v[2].token);
+        CHECK(v[1].price == 95 && v[1].qty == 6);
+        CHECK(gw.engine().open_orders() == 0);
+
+        b.clear();
+        ouch::encode_replace(b, "NOPE", "NEW1", 1, 100);   // unknown token
+        gw.on_message(b.data(), b.size());
+        v = ouch_drain(gw);
+        CHECK(v.size() == 1 && v[0].type == OutType::Rejected);
+        CHECK(tok("NEW1") == v[0].token && v[0].reason == ouch::kBadToken);
+    }
+    // Self-trade prevention over the wire, both directions of yield.
+    {
+        ouch::Gateway gw(1, 10000);
+        ouch_enter(gw, "MINE", Side::Sell, 5, 100, TimeInForce::GTC, 0, 7);
+        ouch_drain(gw);
+        ouch_enter(gw, "TAKE", Side::Buy, 5, 100, TimeInForce::GTC, 0, 7);
+        auto v = ouch_drain(gw);
+        CHECK(v.size() == 2);
+        CHECK(v[0].type == OutType::Accepted);
+        CHECK(v[1].type == OutType::Canceled && tok("TAKE") == v[1].token);
+        CHECK(v[1].reason == ouch::kKilledOnEntry);
+
+        ouch_enter(gw, "WIPE", Side::Buy, 5, 100, TimeInForce::GTC, 0, 7,
+                   StpPolicy::CancelMaker);
+        v = ouch_drain(gw);
+        CHECK(v.size() == 2);
+        CHECK(v[0].type == OutType::Accepted);
+        CHECK(v[1].type == OutType::Canceled && tok("MINE") == v[1].token);
+        CHECK(v[1].reason == ouch::kSelfTrade);
+        CHECK(gw.engine().depth_at(Side::Buy, 100) == 5);  // WIPE rested
+    }
+    // Iceberg display over the wire; outbound frames straight into Mold.
+    {
+        ouch::Gateway gw(1, 10000);
+        ouch_enter(gw, "ICE", Side::Sell, 25, 100, TimeInForce::GTC, 10);
+        CHECK(gw.engine().depth_at(Side::Sell, 100) == 10);
+        CHECK(gw.engine().hidden_at(Side::Sell, 100) == 15);
+
+        auto msgs = gw.take_out();
+        CHECK(msgs.size() == 1);
+        std::vector<uint8_t> pkt;
+        mold::encode("OUCH", 1, msgs, pkt);
+        mold::Header hdr;
+        int64_t n = mold::decode(pkt.data(), pkt.size(), hdr,
+                                 [&](uint64_t, const uint8_t* p, size_t len) {
+            ouch::OutMsg om{};
+            CHECK(ouch::decode_out(p, len, om));
+            CHECK(om.type == OutType::Accepted && tok("ICE") == om.token);
+            CHECK(om.qty == 25);                           // full size to owner
+        });
+        CHECK(n == 1);
+    }
+}
+
 template <typename Eng>
 static void stress_invariants(uint64_t seed) {
-    // Randomized fuzz: after every op, best bid < best ask (no locked or
-    // crossed book) and open-order accounting stays consistent. Run against
-    // both the default and the deferred-event engine (same invariants hold).
+    // Randomized fuzz over the full order-type zoo (plain limits with
+    // every TIF, owned orders under all three STP policies, icebergs,
+    // stops and stop-limits, cancels, modifies, reduces, markets): after
+    // every op, best bid < best ask (no locked or crossed book -- stop
+    // cascades included), and at the end cancelling everything leaves
+    // zero open orders and zero pending stops. Run against both the
+    // default and the deferred-event engine (same invariants hold).
     Recorder r;
     Eng e(1, 2000, r, 1 << 16);
     uint64_t s = seed;
     auto rng = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
     std::vector<OrderId> live;
+    auto track = [&](OrderId id) {
+        if (id != kInvalidOrderId) live.push_back(id);
+    };
     for (int i = 0; i < 200000; ++i) {
         uint64_t roll = rng() % 100;
         Price px = 900 + static_cast<Price>(rng() % 200);
-        if (roll < 55 || live.empty()) {
-            Side side = (rng() & 1) ? Side::Buy : Side::Sell;
-            OrderId id = e.submit_limit(side, px, 1 + rng() % 50);
-            live.push_back(id);
-        } else if (roll < 90) {
+        Side side = (rng() & 1) ? Side::Buy : Side::Sell;
+        OwnerId owner = static_cast<OwnerId>(rng() % 4);        // 0 = anon
+        StpPolicy stp = static_cast<StpPolicy>(rng() % 3);
+        if (roll < 40 || live.empty()) {
+            track(e.submit_limit(side, px, 1 + rng() % 50,
+                                 TimeInForce::GTC, owner, stp));
+        } else if (roll < 46) {
+            track(e.submit_limit(side, px, 1 + rng() % 50,
+                                 TimeInForce::PostOnly, owner, stp));
+        } else if (roll < 55) {
+            track(e.submit_iceberg(side, px, 1 + rng() % 60, 1 + rng() % 10,
+                                   TimeInForce::GTC, owner, stp));
+        } else if (roll < 70) {
             size_t k = rng() % live.size();
             e.cancel(live[k]);  // may already be gone; that's the point
             live[k] = live.back();
             live.pop_back();
-        } else if (roll < 95) {
-            e.submit_market((rng() & 1) ? Side::Buy : Side::Sell,
-                            1 + rng() % 100);
+        } else if (roll < 75) {
+            e.submit_market(side, 1 + rng() % 100, owner, stp);
+        } else if (roll < 80) {
+            // IOC/FOK never rest, so their ids never come back.
+            e.submit_limit(side, px, 1 + rng() % 50,
+                           (roll & 1) ? TimeInForce::IOC : TimeInForce::FOK,
+                           owner, stp);
+        } else if (roll < 87) {
+            Price trig = 900 + static_cast<Price>(rng() % 200);
+            if (roll & 1) {
+                track(e.submit_stop(side, trig, 1 + rng() % 30, owner, stp));
+            } else {
+                track(e.submit_stop_limit(side, trig,
+                                          900 + static_cast<Price>(rng() % 200),
+                                          1 + rng() % 30, owner, stp));
+            }
+        } else if (roll < 94) {
+            e.modify(live[rng() % live.size()], px, 1 + rng() % 50);
         } else {
-            // IOC/FOK never rest, so their ids don't join `live`.
-            e.submit_limit((rng() & 1) ? Side::Buy : Side::Sell, px,
-                           1 + rng() % 50,
-                           (roll & 1) ? TimeInForce::IOC : TimeInForce::FOK);
+            e.reduce(live[rng() % live.size()], 1 + rng() % 10);
         }
         if (e.has_bid() && e.has_ask()) CHECK(e.best_bid() < e.best_ask());
     }
     for (OrderId id : live) e.cancel(id);
     CHECK(e.open_orders() == 0);
+    CHECK(e.pending_stops() == 0);
+}
+
+template <typename Eng>
+static void stress_auction_cycles(uint64_t seed) {
+    // Halt/uncross/resume cycles under random flow: while halted the book
+    // may cross freely; an uncross+resume must leave it un-crossed and
+    // un-locked, every time, and the final accounting must come out clean.
+    Recorder r;
+    Eng e(1, 2000, r, 1 << 16);
+    uint64_t s = seed;
+    auto rng = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+    std::vector<OrderId> live;
+    bool halted = false;
+    Qty crossed_total = 0;
+    for (int i = 0; i < 60000; ++i) {
+        if (i % 4000 == 0) {
+            e.halt();
+            halted = true;
+        } else if (i % 4000 == 700) {
+            crossed_total += e.uncross();
+            e.resume();
+            halted = false;
+            if (e.has_bid() && e.has_ask())
+                CHECK(e.best_bid() < e.best_ask());
+        }
+        uint64_t roll = rng() % 100;
+        Price px = 900 + static_cast<Price>(rng() % 200);
+        Side side = (rng() & 1) ? Side::Buy : Side::Sell;
+        OwnerId owner = static_cast<OwnerId>(rng() % 3);
+        StpPolicy stp = static_cast<StpPolicy>(rng() % 3);
+        if (roll < 45 || live.empty()) {
+            if (live.empty() || (roll & 1)) {
+                OrderId id = e.submit_limit(side, px, 1 + rng() % 50,
+                                            TimeInForce::GTC, owner, stp);
+                if (id != kInvalidOrderId) live.push_back(id);
+            } else {
+                OrderId id = e.submit_iceberg(side, px, 1 + rng() % 60,
+                                              1 + rng() % 10,
+                                              TimeInForce::GTC, owner, stp);
+                if (id != kInvalidOrderId) live.push_back(id);
+            }
+        } else if (roll < 65) {
+            size_t k = rng() % live.size();
+            e.cancel(live[k]);
+            live[k] = live.back();
+            live.pop_back();
+        } else if (roll < 72) {
+            e.submit_market(side, 1 + rng() % 60, owner, stp);
+        } else if (roll < 82) {
+            Price trig = 900 + static_cast<Price>(rng() % 200);
+            OrderId id = e.submit_stop(side, trig, 1 + rng() % 20, owner, stp);
+            if (id != kInvalidOrderId) live.push_back(id);
+        } else if (roll < 92) {
+            e.modify(live[rng() % live.size()], px, 1 + rng() % 50);
+        } else {
+            // IOC ids never rest; PostOnly ids can, so track them too.
+            OrderId id = e.submit_limit(side, px, 1 + rng() % 50,
+                                        (roll & 1) ? TimeInForce::IOC
+                                                   : TimeInForce::PostOnly,
+                                        owner, stp);
+            if (id != kInvalidOrderId) live.push_back(id);
+        }
+        if (!halted && e.has_bid() && e.has_ask())
+            CHECK(e.best_bid() < e.best_ask());
+    }
+    e.resume();
+    for (OrderId id : live) e.cancel(id);
+    CHECK(e.open_orders() == 0);
+    CHECK(e.pending_stops() == 0);
+    CHECK(crossed_total > 0);   // the cycles actually exercised the cross
 }
 
 static void test_stress_invariants() {
     stress_invariants<MatchingEngine<Recorder>>(0x9E3779B97F4A7C15ull);
     stress_invariants<ReentrantMatchingEngine<Recorder>>(0xD1B54A32D192ED03ull);
+    stress_auction_cycles<MatchingEngine<Recorder>>(0xA0761D6478BD642Full);
+    stress_auction_cycles<ReentrantMatchingEngine<Recorder>>(0xE7037ED1A0B428DBull);
 }
 
 // Records the full ordered event tape so two engines can be compared.
@@ -417,6 +1371,20 @@ static void parity_script(Eng& e) {
     e.submit_limit(Side::Buy, 102, 12);                    // multi-level sweep + rest
     e.submit_limit(Side::Buy, 100, 3, TimeInForce::IOC);   // IOC remainder cancel
     e.submit_limit(Side::Sell, 90, 3, TimeInForce::FOK);   // FOK against the resting bid
+    e.submit_limit(Side::Sell, 95, 2, TimeInForce::PostOnly);  // would cross: killed
+    e.submit_limit(Side::Sell, 200, 2, TimeInForce::PostOnly); // passive: rests
+    e.submit_limit(Side::Sell, 96, 4, TimeInForce::GTC, 7);    // owned resting ask
+    e.submit_limit(Side::Buy, 96, 6, TimeInForce::GTC, 7);     // STP: taker killed
+    e.submit_limit(Side::Buy, 96, 6, TimeInForce::GTC, 8,
+                   StpPolicy::CancelMaker);                    // different owner: trades
+    e.submit_iceberg(Side::Sell, 97, 9, 4);                    // dark clips
+    e.submit_limit(Side::Buy, 97, 7);                          // clip, requeue, clip
+    e.submit_iceberg(Side::Buy, 60, 12, 5, TimeInForce::IOC);  // no cross: killed
+    e.submit_stop(Side::Buy, 70, 2);                           // parks (last=50)
+    e.submit_stop_limit(Side::Sell, 40, 39, 2);                // parks
+    e.submit_limit(Side::Sell, 75, 3);
+    e.submit_limit(Side::Buy, 75, 1);                          // print 75: buy stop fires
+    e.submit_market(Side::Sell, 2);                            // may print lower
     OrderId x = e.submit_limit(Side::Buy, 98, 7);
     e.modify(x, 105, 7);                                   // reprice: cancel + accept + match
     e.cancel(x);
@@ -562,10 +1530,18 @@ int main() {
     test_modify_can_cross();
     test_ioc();
     test_fok();
+    test_post_only();
     test_band_rejection();
+    test_self_trade_prevention();
+    test_iceberg();
+    test_stop_orders();
+    test_auction();
+    test_depth_snapshot();
     test_bitmap();
     test_spsc_ring();
     test_mold_udp64();
+    test_ouch_codec();
+    test_ouch_gateway();
     test_stress_invariants();
     test_reentrant_engine();
     test_rl_quoter();
