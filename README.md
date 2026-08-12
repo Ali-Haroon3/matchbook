@@ -7,7 +7,7 @@ The engine speaks the full exchange order-type zoo -- IOC/FOK/post-only,
 icebergs, stops and stop-limits, self-trade prevention -- and runs call
 auctions with an equilibrium-price uncross next to continuous trading.
 
-Zero external dependencies. Header-only core. Builds clean with
+Zero external dependencies.Header-only core. Builds clean with
 `-Wall -Wextra -Wpedantic -Wshadow` and runs clean under ASAN + UBSAN.
 Optional pybind11 bindings for research workflows (off by default; the
 core stays dependency-free).
