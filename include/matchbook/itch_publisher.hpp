@@ -142,6 +142,38 @@ public:
 
     const MatchingEngine<Sink>& engine() const noexcept { return engine_; }
 
+    // GLIMPSE-style snapshot for late joiners: the current displayed
+    // book as out-of-band Add messages -- live references, book priority
+    // order (so the rebuilt queues match), preceded by an 'H' action
+    // when the venue is halted (a call-phase book may stand crossed and
+    // the joiner must accept that). Returns the live sequence number the
+    // joiner should expect next: apply the snapshot through a
+    // BookBuilder, then splice into the live stream at that sequence
+    // (SequenceTracker takes a start; earlier packets skip as
+    // duplicates). Snapshot messages carry timestamp 0 -- they are a
+    // side channel, not part of the live sequence -- and the live
+    // stream's per-message timestamps equal its mold sequence numbers
+    // when each message is framed in order from the start of session.
+    uint64_t snapshot(std::vector<std::vector<uint8_t>>& out) const {
+        if (engine_.is_halted()) {
+            std::vector<uint8_t> b;
+            encode_action(b, 0, stock_, 'H');
+            out.push_back(std::move(b));
+        }
+        for (Side s : {Side::Buy, Side::Sell}) {
+            engine_.visit_orders(
+                s, [&](OrderId id, Side side, Price px, Qty q) {
+                    std::vector<uint8_t> b;
+                    encode_add(b, 0, refs_[id].ref,
+                               side == Side::Buy ? 'B' : 'S',
+                               static_cast<uint32_t>(q), stock_,
+                               static_cast<uint32_t>(px));
+                    out.push_back(std::move(b));
+                });
+        }
+        return seq_;
+    }
+
     // Published messages since the last call, oldest first (bodies only,
     // no framing) -- the shape mold::encode packs.
     std::vector<std::vector<uint8_t>> take_messages() {

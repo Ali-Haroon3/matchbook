@@ -965,6 +965,16 @@ static void test_mold_udp64() {
     CHECK(t.on_packet(9, 2) == 0);   // gap: 6..8 lost
     CHECK(t.gap_messages() == 3);
     CHECK(t.expected() == 11);
+
+    // Late-join splice: start expecting mid-stream; earlier packets are
+    // already-seen, not gaps.
+    mold::SequenceTracker lj(100);
+    CHECK(lj.on_packet(50, 5) == 5);     // pre-snapshot: all skipped
+    CHECK(lj.expected() == 100 && lj.gap_messages() == 0);
+    CHECK(lj.on_packet(99, 2) == 1);     // straddles the join point
+    CHECK(lj.expected() == 101);
+    CHECK(lj.on_packet(101, 1) == 0);
+    CHECK(lj.gap_messages() == 0);
 }
 
 static void test_venue() {
@@ -1399,6 +1409,187 @@ static void test_itch_publisher_roundtrip() {
     pub.engine().visit_levels(Side::Sell, 1 << 12,
                               [&](const LevelView& v) { displayed += v.orders; });
     CHECK(rebuilt.open_orders() == displayed);
+}
+
+static void test_snapshot_late_join() {
+    // Basic shape: snapshot reproduces the displayed book (queue order
+    // included) under live references, and conveys the halt state.
+    {
+        itch::Publisher pub(1, 10000, "MBTEST");
+        OrderId first = pub.submit_limit(Side::Buy, 100, 5);
+        pub.submit_limit(Side::Buy, 100, 7);
+        pub.submit_iceberg(Side::Sell, 105, 30, 10);
+        auto live = pub_drain(pub);
+        uint64_t first_ref = live[0].ref;
+
+        std::vector<std::vector<uint8_t>> snap;
+        uint64_t next = pub.snapshot(snap);
+        CHECK(snap.size() == 3);                    // 2 bids + 1 lit clip
+        CHECK(next == 4);                           // 3 messages published
+
+        Recorder r2;
+        Engine joiner(1, 10000, r2);
+        itch::BookBuilder jbook;
+        for (auto& body : snap) {
+            itch::Message m{};
+            CHECK(itch::parse(body.data(), body.size(), m));
+            CHECK(m.type == itch::MsgType::Add);
+            jbook.apply(joiner, m);
+        }
+        CHECK(joiner.depth_at(Side::Buy, 100) == 12);
+        CHECK(joiner.order_count_at(Side::Buy, 100) == 2);
+        CHECK(joiner.depth_at(Side::Sell, 105) == 10);   // clip only
+        CHECK(joiner.hidden_at(Side::Sell, 105) == 0);   // dark stays dark
+
+        // Live refs align: a post-snapshot fill on the source resolves
+        // against the joiner's book, FIFO order intact.
+        pub.submit_limit(Side::Sell, 100, 5);            // hits `first`
+        auto fills = pub_drain(pub);
+        CHECK(fills.size() == 1 && fills[0].ref == first_ref);
+        jbook.apply(joiner, fills[0]);
+        CHECK(joiner.depth_at(Side::Buy, 100) == 7);
+        CHECK(joiner.order_count_at(Side::Buy, 100) == 1);
+        CHECK(first != kInvalidOrderId);
+    }
+    // Halted snapshot: leads with 'H', and the joiner accepts the
+    // crossed call-phase book.
+    {
+        itch::Publisher pub(1, 10000, "MBTEST");
+        pub.halt();
+        pub.submit_limit(Side::Buy, 102, 5);
+        pub.submit_limit(Side::Sell, 99, 5);
+        pub_drain(pub);
+        std::vector<std::vector<uint8_t>> snap;
+        pub.snapshot(snap);
+        CHECK(snap.size() == 3);                    // H + two adds
+        Recorder r2;
+        Engine joiner(1, 10000, r2);
+        itch::BookBuilder jbook;
+        for (auto& body : snap) {
+            itch::Message m{};
+            CHECK(itch::parse(body.data(), body.size(), m));
+            jbook.apply(joiner, m);
+        }
+        CHECK(joiner.is_halted());
+        CHECK(r2.trades.empty());                   // crossed, standing
+        CHECK(joiner.best_bid() == 102 && joiner.best_ask() == 99);
+    }
+    // The full property: join mid-stream off a snapshot plus the mold
+    // wire, replay the whole wire through a spliced SequenceTracker
+    // (pre-join packets skip as duplicates), then track live flow to the
+    // end -- the joiner's book must match the source throughout.
+    {
+        itch::Publisher pub(1, 2000, "MBTEST", 1 << 16);
+        std::vector<std::vector<uint8_t>> wire;   // one packet per message
+        uint64_t wire_seq = 1;
+        auto flush_wire = [&] {
+            for (auto& body : pub.take_messages()) {
+                std::vector<uint8_t> pkt;
+                mold::encode("SNAP", wire_seq++, {body}, pkt);
+                wire.push_back(std::move(pkt));
+            }
+        };
+
+        Recorder rj;
+        Engine joiner(1, 2000, rj, 1 << 16);
+        itch::BookBuilder jbook;
+        mold::SequenceTracker tracker;
+        bool joined = false;
+        size_t wire_pos = 0;   // next unconsumed packet post-join
+
+        auto feed_joiner = [&](size_t from) {
+            for (size_t k = from; k < wire.size(); ++k) {
+                mold::Header hdr;
+                mold::decode(wire[k].data(), wire[k].size(), hdr,
+                             [&](uint64_t, const uint8_t* p, size_t len) {
+                    if (tracker.on_packet(hdr.seq, 1) == 0) {
+                        itch::Message m{};
+                        if (itch::parse(p, len, m)) jbook.apply(joiner, m);
+                    }
+                });
+            }
+            wire_pos = wire.size();
+        };
+        auto books_equal = [&] {
+            for (Side side : {Side::Buy, Side::Sell}) {
+                auto a = pub.engine().top_levels(side, 1 << 12);
+                auto b = joiner.top_levels(side, 1 << 12);
+                CHECK(a.size() == b.size());
+                for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                    CHECK(a[i].price == b[i].price);
+                    CHECK(a[i].qty == b[i].qty);
+                    CHECK(a[i].orders == b[i].orders);
+                }
+            }
+        };
+
+        uint64_t s = 0xC3A5E9711D0B4F27ull;
+        auto rng = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+        std::vector<OrderId> live;
+        for (int i = 0; i < 12000; ++i) {
+            if (i % 3000 == 0) {
+                pub.halt();
+            } else if (i % 3000 == 400) {
+                pub.uncross();
+                pub.resume();
+            }
+            uint64_t roll = rng() % 100;
+            Price px = 900 + static_cast<Price>(rng() % 200);
+            Side side = (rng() & 1) ? Side::Buy : Side::Sell;
+            if (roll < 40 || live.empty()) {
+                OrderId id = pub.submit_limit(side, px, 1 + rng() % 50);
+                if (id != kInvalidOrderId) live.push_back(id);
+            } else if (roll < 50) {
+                OrderId id = pub.submit_iceberg(side, px, 1 + rng() % 60,
+                                                1 + rng() % 10);
+                if (id != kInvalidOrderId) live.push_back(id);
+            } else if (roll < 65) {
+                size_t k = rng() % live.size();
+                pub.cancel(live[k]);
+                live[k] = live.back();
+                live.pop_back();
+            } else if (roll < 72) {
+                pub.submit_market(side, 1 + rng() % 60);
+            } else if (roll < 80) {
+                OrderId id = pub.submit_stop(
+                    side, 900 + static_cast<Price>(rng() % 200),
+                    1 + rng() % 20);
+                if (id != kInvalidOrderId) live.push_back(id);
+            } else if (roll < 92) {
+                pub.modify(live[rng() % live.size()], px, 1 + rng() % 50);
+            } else {
+                pub.reduce(live[rng() % live.size()], 1 + rng() % 10);
+            }
+            flush_wire();
+
+            if (i == 9200) {
+                // Join mid-stream, deliberately inside a halt window
+                // (9200 % 3000 = 200 < 400): the snapshot leads with 'H'
+                // and hands over a legitimately crossed book.
+                std::vector<std::vector<uint8_t>> snap;
+                uint64_t next = pub.snapshot(snap);
+                for (auto& body : snap) {
+                    itch::Message m{};
+                    if (itch::parse(body.data(), body.size(), m))
+                        jbook.apply(joiner, m);
+                }
+                tracker = mold::SequenceTracker(next);
+                feed_joiner(0);        // whole wire: pre-join packets skip
+                CHECK(tracker.gap_messages() == 0);
+                joined = true;
+                books_equal();
+            } else if (joined) {
+                feed_joiner(wire_pos);
+                if (i % 200 == 0) books_equal();
+            }
+        }
+        pub.resume();
+        flush_wire();
+        feed_joiner(wire_pos);
+        books_equal();
+        CHECK(joined);
+        CHECK(tracker.gap_messages() == 0);
+    }
 }
 
 // Space-pad a token the way it appears on the wire.
@@ -2283,6 +2474,7 @@ int main() {
     test_itch_encode_roundtrip();
     test_itch_publisher();
     test_itch_publisher_roundtrip();
+    test_snapshot_late_join();
     test_ouch_codec();
     test_ouch_gateway();
     test_stress_invariants();
