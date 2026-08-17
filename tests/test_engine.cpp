@@ -966,6 +966,122 @@ static void test_mold_udp64() {
     CHECK(t.expected() == 11);
 }
 
+static void test_venue() {
+    // Registration, lookup, per-symbol isolation.
+    {
+        Venue<Recorder> v;
+        SymbolId a = v.add_symbol("AAA", 1, 1000);
+        SymbolId b = v.add_symbol("BBB", 1, 2000);
+        CHECK(v.size() == 2 && a != b);
+        CHECK(v.add_symbol("AAA", 9, 9) == a);          // idempotent
+        CHECK(v.find("AAA") == a && v.find("BBB") == b);
+        CHECK(v.find("CCC") == kInvalidSymbol);
+        CHECK(std::string(v.name(a)) == "AAA     ");
+
+        v.at(a).submit_limit(Side::Sell, 100, 5);
+        v.at(b).submit_limit(Side::Buy, 100, 5);        // different book
+        CHECK(v.handler(a).trades.empty());
+        CHECK(v.handler(b).trades.empty());
+        CHECK(v.at(a).has_ask() && !v.at(a).has_bid());
+        CHECK(v.at(b).has_bid() && !v.at(b).has_ask());
+        v.at(a).submit_limit(Side::Buy, 100, 5);        // crosses only in A
+        CHECK(v.handler(a).trades.size() == 1);
+        CHECK(v.handler(b).trades.empty());
+        CHECK(v.at(b).depth_at(Side::Buy, 100) == 5);   // B untouched
+        // Band is per symbol: 100 is out of band for neither, 1500 only
+        // valid in B.
+        CHECK(v.at(a).submit_limit(Side::Buy, 1500, 1) == kInvalidOrderId);
+        CHECK(v.at(b).submit_limit(Side::Buy, 1500, 1) != kInvalidOrderId);
+    }
+    // VenueBookBuilder routes a mixed feed by ref across symbols.
+    {
+        Venue<Recorder> v;
+        v.add_symbol("AAA", 1, 1000);
+        v.add_symbol("BBB", 1, 1000);
+        itch::VenueBookBuilder book;
+
+        auto add = [&](uint64_t ref, const char* sym, Side side, Qty q,
+                       Price px) {
+            itch::Message m{};
+            m.type = itch::MsgType::Add;
+            m.ref = ref; m.side = side; m.qty = q; m.price = px;
+            std::snprintf(m.stock, sizeof(m.stock), "%-8s", sym);
+            book.apply(v, m);
+        };
+        add(1, "AAA", Side::Buy, 10, 100);
+        add(2, "BBB", Side::Buy, 20, 100);
+        CHECK(v.at(0).depth_at(Side::Buy, 100) == 10);
+        CHECK(v.at(1).depth_at(Side::Buy, 100) == 20);
+
+        itch::Message ex{};
+        ex.type = itch::MsgType::Execute; ex.ref = 2; ex.qty = 5;
+        book.apply(v, ex);                              // hits BBB only
+        CHECK(v.at(0).depth_at(Side::Buy, 100) == 10);
+        CHECK(v.at(1).depth_at(Side::Buy, 100) == 15);
+
+        itch::Message rp{};
+        rp.type = itch::MsgType::Replace;
+        rp.ref = 1; rp.new_ref = 3; rp.qty = 7; rp.price = 99;
+        book.apply(v, rp);
+        CHECK(v.at(0).depth_at(Side::Buy, 99) == 7);
+        CHECK(!v.at(0).has_bid() || v.at(0).best_bid() == 99);
+
+        itch::Message del{};
+        del.type = itch::MsgType::Delete; del.ref = 3;
+        book.apply(v, del);
+        CHECK(!v.at(0).has_bid());
+        CHECK(v.at(1).depth_at(Side::Buy, 100) == 15);  // BBB untouched
+
+        // Unknown symbol with auto-band off: counted, ignored.
+        add(9, "ZZZ", Side::Buy, 1, 100);
+        CHECK(v.size() == 2 && book.dropped() == 1);
+    }
+    // Auto-band registers unknown symbols around their first price; adds
+    // outside a book's band are dropped without corrupting the ref map.
+    {
+        Venue<Recorder> v;
+        itch::VenueBookBuilder book(50);                // +/- 50 ticks
+        auto add = [&](uint64_t ref, const char* sym, Price px) {
+            itch::Message m{};
+            m.type = itch::MsgType::Add;
+            m.ref = ref; m.side = Side::Buy; m.qty = 1; m.price = px;
+            std::snprintf(m.stock, sizeof(m.stock), "%-8s", sym);
+            book.apply(v, m);
+        };
+        add(1, "NEW", 1000);                            // registers [950,1050]
+        CHECK(v.size() == 1 && v.find("NEW") == 0);
+        CHECK(v.at(0).depth_at(Side::Buy, 1000) == 1);
+        add(2, "NEW", 1050);                            // edge: in band
+        CHECK(v.at(0).depth_at(Side::Buy, 1050) == 1);
+        add(3, "NEW", 1051);                            // out of band: dropped
+        CHECK(book.dropped() == 1);
+        itch::Message del{};
+        del.type = itch::MsgType::Delete; del.ref = 3;  // dropped ref: no-op
+        book.apply(v, del);
+        CHECK(v.at(0).open_orders() == 2);
+        // Low first price clamps the band bottom at 1.
+        add(4, "PENNY", 30);
+        SymbolId p = v.find("PENNY");
+        CHECK(p != kInvalidSymbol);
+        CHECK(v.at(p).submit_limit(Side::Buy, 1, 1) != kInvalidOrderId);
+    }
+    // Trading actions route halt/resume to the named book only.
+    {
+        Venue<Recorder> v;
+        SymbolId a = v.add_symbol("AAA", 1, 1000);
+        SymbolId b = v.add_symbol("BBB", 1, 1000);
+        itch::VenueBookBuilder book;
+        itch::Message h{};
+        h.type = itch::MsgType::Action; h.state = 'H';
+        std::snprintf(h.stock, sizeof(h.stock), "%-8s", "AAA");
+        book.apply(v, h);
+        CHECK(v.at(a).is_halted() && !v.at(b).is_halted());
+        h.state = 'T';
+        book.apply(v, h);
+        CHECK(!v.at(a).is_halted());
+    }
+}
+
 static void test_itch_encode_roundtrip() {
     const char stock[8] = {'M','B','T','E','S','T',' ',' '};
     std::vector<uint8_t> b;
@@ -2015,6 +2131,7 @@ int main() {
     test_bitmap();
     test_spsc_ring();
     test_mold_udp64();
+    test_venue();
     test_itch_encode_roundtrip();
     test_itch_publisher();
     test_itch_publisher_roundtrip();
