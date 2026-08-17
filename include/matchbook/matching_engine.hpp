@@ -248,6 +248,14 @@ public:
     bool  has_last_trade() const noexcept { return has_last_; }
     Price last_trade() const noexcept { return last_px_; }
 
+    // Displayed remaining quantity of a live resting order; 0 if the id
+    // is unknown, dead, or a pending stop (which is not displayed).
+    Qty order_qty(OrderId id) const noexcept {
+        const Order* o = (id < orders_.size()) ? orders_[id] : nullptr;
+        if (!o || (o->flags & kStopPending)) return 0;
+        return o->qty;
+    }
+
     // Pending (untriggered) stop orders, total and per trigger level.
     size_t pending_stops() const noexcept { return pending_stops_; }
     Qty stop_depth_at(Side side, Price stop_price) const noexcept {
@@ -300,6 +308,43 @@ public:
         return out;
     }
 
+    // Visit every resting order on one side in book priority (best price
+    // first, FIFO within a level): f(id, side, price, displayed_qty).
+    // Displayed state only -- iceberg reserve is deliberately absent, so
+    // walking both sides reproduces exactly what a feed consumer sees.
+    // Cold path; do not mutate the engine from f.
+    template <typename F>
+    void visit_orders(Side side, F&& f) const {
+        const auto& levels = (side == Side::Buy) ? bids_ : asks_;
+        int64_t i = (side == Side::Buy) ? best_bid_ : best_ask_;
+        while (i >= 0) {
+            for (const Order* o = levels[static_cast<size_t>(i)].head;
+                 o != nullptr; o = o->next)
+                f(o->id, o->side, o->price, o->qty);
+            i = (side == Side::Buy) ? bid_map_.find_le(i - 1)
+                                    : ask_map_.find_ge(i + 1);
+        }
+    }
+
+    // Visit every pending stop id, in trigger-pump order (buy stops
+    // ascending trigger, then sell stops descending, FIFO within a
+    // trigger). Cold path; do not mutate the engine from f.
+    template <typename F>
+    void visit_stops(F&& f) const {
+        if (stop_bids_.empty()) return;
+        for (int64_t i = stop_bid_map_.find_ge(0); i >= 0;
+             i = stop_bid_map_.find_ge(i + 1))
+            for (const Order* o = stop_bids_[static_cast<size_t>(i)].head;
+                 o != nullptr; o = o->next)
+                f(o->id);
+        for (int64_t i =
+                 stop_ask_map_.find_le(static_cast<int64_t>(n_levels_) - 1);
+             i >= 0; i = stop_ask_map_.find_le(i - 1))
+            for (const Order* o = stop_asks_[static_cast<size_t>(i)].head;
+                 o != nullptr; o = o->next)
+                f(o->id);
+    }
+
     size_t open_orders() const noexcept { return pool_.in_use(); }
 
 private:
@@ -322,13 +367,13 @@ private:
 
     // A buffered handler event (only materialized when DeferEvents).
     struct Event {
-        enum class Kind : uint8_t { Accept, Trade, Cancel, Reject };
+        enum class Kind : uint8_t { Accept, Trade, Cancel, Reject, Rest };
         Kind    kind;
         Trade   trade{};        // Trade
-        OrderId id    = 0;      // Accept/Cancel/Reject
-        Side    side  = Side::Buy;  // Accept
-        Price   price = 0;      // Accept
-        Qty     qty   = 0;      // Accept
+        OrderId id    = 0;      // Accept/Cancel/Reject/Rest
+        Side    side  = Side::Buy;  // Accept/Rest
+        Price   price = 0;      // Accept/Rest
+        Qty     qty   = 0;      // Accept/Rest
     };
 
     void emit_accept(OrderId id, Side s, Price p, Qty q) {
@@ -365,12 +410,32 @@ private:
         }
     }
 
+    // Optional hook (see HasOnRest in types.hpp): quantity became visible
+    // in the book. Compiles to nothing for handlers without on_rest.
+    void emit_rest(OrderId id, Side s, Price p, Qty displayed) {
+        if constexpr (HasOnRest<Handler>) {
+            if constexpr (DeferEvents) {
+                Event e; e.kind = Event::Kind::Rest;
+                e.id = id; e.side = s; e.price = p; e.qty = displayed;
+                queue_.push_back(e);
+            } else {
+                h_.on_rest(id, s, p, displayed);
+            }
+        } else {
+            (void)id; (void)s; (void)p; (void)displayed;
+        }
+    }
+
     void dispatch(const Event& e) {
         switch (e.kind) {
             case Event::Kind::Accept: h_.on_accept(e.id, e.side, e.price, e.qty); break;
             case Event::Kind::Trade:  h_.on_trade(e.trade); break;
             case Event::Kind::Cancel: h_.on_cancel(e.id); break;
             case Event::Kind::Reject: h_.on_reject(e.id); break;
+            case Event::Kind::Rest:
+                if constexpr (HasOnRest<Handler>)
+                    h_.on_rest(e.id, e.side, e.price, e.qty);
+                break;
         }
     }
 
@@ -639,10 +704,12 @@ private:
 
     // Consume `f` from the head order of `lvl` (displayed first, then any
     // iceberg reserve), removing it if fully spent. A part-consumed
-    // iceberg is renormalized to a fresh clip so the post-auction book is
-    // shaped exactly as if the clip had replenished. Returns true if the
+    // iceberg is renormalized to a fresh clip and re-queued at the back
+    // of the level -- exactly as if the clip had replenished in
+    // continuous trading, so a feed consumer rebuilding the book from
+    // published adds lands on the same queue order. Returns true if the
     // level emptied.
-    bool auction_fill(Level& lvl, Order* o, Qty f) {
+    bool auction_fill(Level& lvl, Order* o, Qty f, Price px) {
         Qty from_disp = (f < o->qty) ? f : o->qty;
         o->qty    -= from_disp;
         lvl.total -= from_disp;
@@ -657,6 +724,16 @@ private:
                 o->qty      = clip;
                 lvl.total  += clip;
                 lvl.hidden -= clip;
+                emit_rest(o->id, o->side, px, clip);
+                if (o->next) {  // requeue behind the others
+                    lvl.head = o->next;
+                    lvl.head->prev = nullptr;
+                    o->prev = lvl.tail;
+                    o->next = nullptr;
+                    lvl.tail->next = o;
+                    lvl.tail = o;
+                }
+                return false;
             }
         }
         if (o->qty == 0) {
@@ -732,18 +809,21 @@ private:
             if (a->flags & kIceberg)
                 aq += extras_[static_cast<size_t>(a->ext)].reserve;
             Qty f = (bq < aq) ? bq : aq;
-            Trade t{b->id, a->id, p, f, Side::Buy};
-            if (auction_fill(bl, b, f)) {
+            // Trade first, then the fills: a handler (and the published
+            // feed) sees the execution before any renormalized iceberg
+            // clip re-rests -- the same E-then-A order as a continuous
+            // replenish.
+            last_px_  = p;
+            has_last_ = true;
+            emit_trade(Trade{b->id, a->id, p, f, Side::Buy});
+            if (auction_fill(bl, b, f, p)) {
                 bid_map_.clear(static_cast<size_t>(best_bid_));
                 best_bid_ = bid_map_.find_le(best_bid_ - 1);
             }
-            if (auction_fill(al, a, f)) {
+            if (auction_fill(al, a, f, p)) {
                 ask_map_.clear(static_cast<size_t>(best_ask_));
                 best_ask_ = ask_map_.find_ge(best_ask_ + 1);
             }
-            last_px_  = p;
-            has_last_ = true;
-            emit_trade(t);
             crossed += f;
         }
         return crossed;
@@ -1052,6 +1132,7 @@ private:
                         o->qty      = clip;
                         lvl.total  += clip;
                         lvl.hidden -= clip;
+                        emit_rest(o->id, o->side, px, clip);
                         if (o->next) {  // requeue behind the others
                             lvl.head = o->next;
                             lvl.head->prev = nullptr;
@@ -1117,6 +1198,7 @@ private:
         lvl.total += o->qty;   // displayed only; reserve went to lvl.hidden
         ++lvl.count;
         orders_[id] = o;
+        emit_rest(id, side, price, o->qty);
     }
 
     // Unlink a resting order from its level; fix best/bitmap if the level

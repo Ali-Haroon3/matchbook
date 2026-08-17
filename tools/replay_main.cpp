@@ -1,12 +1,16 @@
 // Replays an ITCH 5.0 file through the matching engine using the intended
 // production shape: one thread parses the feed and normalizes messages,
-// the other owns the book. They communicate over the lock-free SPSC ring.
+// the other owns the books. They communicate over the lock-free SPSC ring.
 //
-//   usage: replay <file.itch> [SYMBOL]
+//   usage: replay <file.itch> [SYMBOL...]
 //
-// Works on tools/itchgen output and on real Nasdaq TotalView sample files.
-// ITCH prices are in 1/10000 dollars; the book here ticks in the same
-// units to avoid any rounding.
+// One or more symbols build side by side in a Venue (default: MBTEST,
+// itchgen's symbol). Each book is registered lazily on the symbol's
+// first Add, banded +/- $13.11 (1<<17 ticks) around that price -- adds
+// that later run outside the band are counted as dropped rather than
+// growing the book without bound. Works on tools/itchgen output and on
+// real Nasdaq TotalView sample files. ITCH prices are in 1/10000
+// dollars; the books tick in the same units to avoid any rounding.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -14,12 +18,13 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "matchbook/itch_book_builder.hpp"
 #include "matchbook/itch_parser.hpp"
-#include "matchbook/matching_engine.hpp"
 #include "matchbook/spsc_ring.hpp"
+#include "matchbook/venue.hpp"
 
 using namespace matchbook;
 using Clock = std::chrono::steady_clock;
@@ -37,13 +42,17 @@ struct Stats {
 SpscRing<itch::Message, 1 << 16> g_ring;
 std::atomic<bool> g_feed_done{false};
 
-void feed_thread(const std::string& path, const std::string& symbol,
+std::string pad8(const std::string& s) {
+    char buf[9];
+    std::snprintf(buf, sizeof(buf), "%-8s", s.c_str());
+    return std::string(buf, 8);
+}
+
+void feed_thread(const std::string& path,
+                 const std::unordered_set<std::string>& symbols,
                  uint64_t* parsed_out, uint64_t* matched_out) {
     std::ifstream in(path, std::ios::binary);
-    std::vector<uint8_t> buf(1 << 20);
     uint64_t parsed = 0, matched = 0;
-    char padded[9];
-    std::snprintf(padded, sizeof(padded), "%-8s", symbol.c_str());
 
     uint8_t hdr[2];
     std::vector<uint8_t> body;
@@ -55,10 +64,12 @@ void feed_thread(const std::string& path, const std::string& symbol,
         ++parsed;
         itch::Message m;
         if (!itch::parse(body.data(), len, m)) continue;
-        // Symbol filter applies to adds; lifecycle msgs are ref-keyed and
-        // filtered on the consumer side via the ref map.
-        if (m.type == itch::MsgType::Add &&
-            std::memcmp(m.stock, padded, 8) != 0) continue;
+        // Symbol filter applies to adds (and trading actions); lifecycle
+        // msgs are ref-keyed and filtered on the consumer side via the
+        // ref map.
+        if ((m.type == itch::MsgType::Add ||
+             m.type == itch::MsgType::Action) &&
+            symbols.count(std::string(m.stock, 8)) == 0) continue;
         ++matched;
         while (!g_ring.try_push(m)) { /* backpressure */ }
     }
@@ -71,19 +82,19 @@ void feed_thread(const std::string& path, const std::string& symbol,
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s <file.itch> [SYMBOL]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <file.itch> [SYMBOL...]\n", argv[0]);
         return 1;
     }
     std::string path = argv[1];
-    std::string symbol = (argc > 2) ? argv[2] : "MBTEST";
+    std::unordered_set<std::string> symbols;
+    for (int i = 2; i < argc; ++i) symbols.insert(pad8(argv[i]));
+    if (symbols.empty()) symbols.insert(pad8("MBTEST"));
 
     uint64_t parsed = 0, matched = 0;
-    std::thread feeder(feed_thread, path, symbol, &parsed, &matched);
+    std::thread feeder(feed_thread, path, symbols, &parsed, &matched);
 
-    Stats h;
-    // Band: $0.0001 .. $2000.0000 in 1/10000-dollar ticks.
-    MatchingEngine<Stats> e(1, 20'000'000, h, 1 << 21);
-    itch::BookBuilder book;
+    Venue<Stats> venue;
+    itch::VenueBookBuilder book(1 << 17);   // +/- $13.11 around first price
 
     uint64_t applied = 0;
     auto t0 = Clock::now();
@@ -94,7 +105,7 @@ int main(int argc, char** argv) {
                 g_ring.size_approx() == 0) break;
             continue;
         }
-        book.apply(e, m);
+        book.apply(venue, m);
         ++applied;
     }
     auto t1 = Clock::now();
@@ -102,18 +113,24 @@ int main(int argc, char** argv) {
 
     double sec = std::chrono::duration<double>(t1 - t0).count();
     std::printf("parsed:      %llu messages\n", (unsigned long long)parsed);
-    std::printf("for %s: %llu messages applied\n", symbol.c_str(),
-                (unsigned long long)applied);
+    std::printf("applied:     %llu messages across %zu book(s)"
+                " (%llu dropped)\n",
+                (unsigned long long)applied, venue.size(),
+                (unsigned long long)book.dropped());
     std::printf("elapsed:     %.3f s (%.2f M msgs/s applied)\n", sec,
                 applied / sec / 1e6);
-    std::printf("trades:      %llu\n", (unsigned long long)h.trades);
-    if (e.has_bid() && e.has_ask()) {
-        std::printf("final book:  bid %.4f x ask %.4f, %zu open orders\n",
-                    e.best_bid() / 10000.0, e.best_ask() / 10000.0,
-                    e.open_orders());
-    } else {
-        std::printf("final book:  one or both sides empty, %zu open orders\n",
-                    e.open_orders());
+    for (SymbolId s = 0; s < venue.size(); ++s) {
+        const auto& e = venue.at(s);
+        std::printf("%.8s  trades %llu", venue.name(s),
+                    (unsigned long long)venue.handler(s).trades);
+        if (e.has_bid() && e.has_ask()) {
+            std::printf("  bid %.4f x ask %.4f  %zu open\n",
+                        e.best_bid() / 10000.0, e.best_ask() / 10000.0,
+                        e.open_orders());
+        } else {
+            std::printf("  one or both sides empty, %zu open\n",
+                        e.open_orders());
+        }
     }
     return 0;
 }

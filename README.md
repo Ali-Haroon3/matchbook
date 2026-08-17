@@ -4,10 +4,13 @@ A low-latency limit order book and matching engine in C++20, with a Nasdaq
 ITCH 5.0 feed handler, a lock-free SPSC pipeline between the feed and
 matching threads, and an Avellaneda-Stoikov market-making layer on top.
 The engine speaks the full exchange order-type zoo -- IOC/FOK/post-only,
-icebergs, stops and stop-limits, self-trade prevention -- and runs call
-auctions with an equilibrium-price uncross next to continuous trading.
+icebergs, stops and stop-limits, self-trade prevention -- runs call
+auctions with an equilibrium-price uncross next to continuous trading,
+and closes the loop as a venue: OUCH-style order entry in, ITCH 5.0
+market data out, with a round-trip test proving a consumer of the
+published feed reconstructs the identical displayed book.
 
-Zero external dependencies.Header-only core. Builds clean with
+Zero external dependencies. Header-only core. Builds clean with
 `-Wall -Wextra -Wpedantic -Wshadow` and runs clean under ASAN + UBSAN.
 Optional pybind11 bindings for research workflows (off by default; the
 core stays dependency-free).
@@ -234,6 +237,69 @@ address argument selects the NIC, as production multicast feeds do;
 bit-identical to the file replay's. A receiver that misses the
 end-of-session packet exits after 5s of feed silence instead of hanging.
 
+## Market data out (ITCH publisher)
+
+`itch_publisher.hpp` is the other half of the venue: a `Publisher`
+wraps the engine and publishes its life as spec-layout ITCH 5.0
+(`itch_encode.hpp` holds the encoders), describing the *displayed*
+book. Resting quantity and every replenished iceberg clip go out as
+`A` with a fresh reference; continuous fills as maker-side `E`; auction
+fills as `C` at the clearing price plus one aggregate `Q` cross whose
+volume is where hidden participation shows up; silent in-place amends
+as `X`/`D` diffed across the call; halts as `H` trading actions, which
+`BookBuilder` now honors so a consumer's book may stand crossed through
+a call phase exactly like the venue's. Kills, rejects, and pending
+stops publish nothing -- they never touched the displayed book.
+
+The property that keeps this honest: the round-trip test drives 40k
+random operations spanning every order type and auction cycles, parses
+the published stream with the repo's own parser, applies it through
+`BookBuilder` into a second engine, and requires that book to match the
+source level-for-level -- prices, quantities, order counts, best
+prices -- continuously. The publisher needs exactly two engine hooks:
+an optional compile-time `on_rest` handler callback (accept announces
+intent; only rest changes the displayed book) and an `order_qty`
+accessor for diffing silent amends.
+
+**Late joiners** get a GLIMPSE-style snapshot: `Publisher::snapshot()`
+serializes the displayed book as out-of-band Add messages under the
+live references (leading with the halt state, since a call-phase book
+legitimately stands crossed) and returns the sequence to splice into
+the live stream at; `mold::SequenceTracker` takes that starting
+sequence, so replayed pre-join packets skip as already-seen rather than
+double-applying or counting as gaps. The test joins mid-stream, inside
+a halt, off snapshot + full-wire replay, and tracks the source book
+level-for-level to the end.
+
+## Multi-symbol venues
+
+`venue.hpp` runs one engine per symbol -- each with its own price band
+and its own Handler instance, so event streams stay attributable --
+registered explicitly, because the flat per-symbol level arrays cost
+band x 2 x sizeof(Level) and that belongs in the caller's hands, not
+hidden behind whole-tape magic. `itch::VenueBookBuilder` routes a mixed
+feed across the books via one day-unique ref map, honors per-symbol
+trading actions, and offers an auto-band mode (register a symbol on its
+first Add, banded around that price; later out-of-band adds count as
+dropped instead of growing books without bound). `replay` now takes
+multiple symbols and builds them side by side.
+
+## Pre-trade risk (market access gate)
+
+`risk_gate.hpp` is the 15c3-5-shaped layer: a `RiskGate` owns the
+engine, mirrors its order-entry surface, and refuses flow before the
+engine sees it -- kill switch (with `kill_and_cancel_all()` flattening
+resting orders and pending stops), a clockless per-window message
+budget, an optional market-order ban, per-order quantity and notional
+caps, a price collar around the last trade on every price that can
+execute, an open-order cap, and a per-owner net-filled position limit
+with a worst-case pre-check fed by the gate's own fill tracking.
+Rejections are synchronous return values with recorded reasons and
+counters. Two absolutes match how real gates behave: risk *reduction*
+(cancel/reduce) is never blocked, and a default-limits gate is a pure
+passthrough -- pinned by an event-tape parity test against a bare
+engine.
+
 ## Order entry (OUCH-style)
 
 `ouch.hpp` is the client-facing counterpart to the ITCH side: an
@@ -316,12 +382,26 @@ outbound into Mold), the ring, and the
 Q-learning quoter (bucketing bounds, update math, uncrossed quotes), and
 the re-entrant engine (event-tape parity with the default mode, a handler
 that cancels the maker from inside on_trade, a handler that re-submits
-from a fill), plus two randomized fuzzes — run against both the default
-and deferred-event engines — throwing the full order-type zoo at the
-book (200k ops) and driving halt/uncross/resume cycles under random flow
-(60k ops), asserting the book is never locked or crossed and the
-accounting comes out clean after every operation. CI runs the suite in
-Release and under ASAN + UBSAN.
+from a fill), the ITCH encoders and publisher (mapping unit tests plus
+the 40k-op round-trip rebuild above), the snapshot/late-join splice
+(including a mid-halt join off a crossed book), the multi-symbol venue
+and its routing builder, the risk gate (every limit tripped and the
+default-limits passthrough parity), plus two randomized fuzzes — run
+against both the default and deferred-event engines — throwing the full
+order-type zoo at the book (200k ops) and driving halt/uncross/resume
+cycles under random flow (60k ops), asserting the book is never locked
+or crossed and the accounting comes out clean after every operation.
+
+On top of the invariant fuzzes sits a **differential fuzz**:
+`tests/reference_engine.hpp` is a second, deliberately naive
+implementation of the entire public contract — `std::map`, `std::deque`,
+linear scans, every order type, STP, stops, auctions — and 75k lockstep
+operations require the fast engine to agree with it on every return
+value, every event in order with all fields, and the whole book state
+(levels, hidden, counts, last trade, stop and open-order accounting)
+throughout. Mutation-checked: breaking FIFO insertion or stop fire
+order makes it fail by the hundreds of thousands of checks. CI runs the
+suite in Release and under ASAN + UBSAN.
 
 ## Roadmap
 
@@ -335,6 +415,11 @@ Release and under ASAN + UBSAN.
 - ~~Call auctions: halt / equilibrium-price uncross / resume~~ done: `halt()`, `uncross()`, `resume()`
 - ~~L2 depth snapshots with per-level order counts~~ done: `top_levels()`, `visit_levels()`
 - ~~OUCH-style binary order entry with a token-tracking session gateway~~ done: `ouch.hpp`
+- ~~Outbound ITCH publisher with a feed-consumer round-trip proof~~ done: `itch_publisher.hpp`, `itch_encode.hpp`
+- ~~Differential fuzz against a naive reference implementation~~ done: `tests/reference_engine.hpp`
+- ~~Multi-symbol venue with a routing book builder~~ done: `venue.hpp`, `itch::VenueBookBuilder`
+- ~~Pre-trade risk gate (15c3-5-style market access controls)~~ done: `risk_gate.hpp`
+- ~~Snapshot/late-join recovery (GLIMPSE-style)~~ done: `Publisher::snapshot()`, spliced `SequenceTracker`
 
 ## License
 

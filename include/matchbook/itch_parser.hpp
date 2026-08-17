@@ -14,7 +14,9 @@
 namespace matchbook::itch {
 
 // Normalized message handed from the feed thread to the matching thread.
-enum class MsgType : uint8_t { Add, Execute, Cancel, Delete, Replace, Other };
+enum class MsgType : uint8_t {
+    Add, Execute, Cancel, Delete, Replace, Action, Other
+};
 
 struct Message {
     MsgType  type;
@@ -23,7 +25,8 @@ struct Message {
     Side     side;       // Add only
     Qty      qty;
     Price    price;      // in ITCH units: price * 10000 (i.e. 1/100 cent)
-    char     stock[9];   // Add only, space-padded, NUL-terminated here
+    char     stock[9];   // Add/Action only, space-padded, NUL-terminated here
+    char     state;      // Action only: 'H' halted, 'T' trading
 };
 
 inline uint16_t be16(const uint8_t* p) noexcept {
@@ -89,6 +92,14 @@ inline bool parse(const uint8_t* body, size_t len, Message& out) noexcept {
             out.new_ref = be64(body + 19);
             out.qty     = be32(body + 27);
             out.price   = static_cast<Price>(be32(body + 31));
+            return true;
+        }
+        case 'H': {  // Stock Trading Action, 25 bytes
+            if (len < 25) return false;
+            out.type = MsgType::Action;
+            std::memcpy(out.stock, body + 11, 8);
+            out.stock[8] = '\0';
+            out.state = static_cast<char>(body[19]);
             return true;
         }
         default:

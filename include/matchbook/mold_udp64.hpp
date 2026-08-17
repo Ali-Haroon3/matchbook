@@ -94,6 +94,13 @@ inline void encode_end(const char* session, uint64_t seq,
 // forward, which is the right behavior for lossy replay too.
 class SequenceTracker {
 public:
+    // Start expecting `first`: 1 (default) for a from-the-open listener;
+    // a late joiner passes the sequence its snapshot said comes next, so
+    // every earlier packet skips as already-seen instead of applying
+    // twice or counting as a gap.
+    explicit SequenceTracker(uint64_t first = 1) noexcept
+        : expected_(first) {}
+
     // Call per data packet. Returns how many leading blocks were already
     // seen (skip that many; == count means the whole packet is a
     // duplicate). If the packet starts ahead of the expected sequence,
