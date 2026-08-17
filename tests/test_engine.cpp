@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "matchbook/itch_book_builder.hpp"
+#include "matchbook/itch_encode.hpp"
+#include "matchbook/itch_publisher.hpp"
 #include "matchbook/matching_engine.hpp"
 #include "matchbook/mold_udp64.hpp"
 #include "matchbook/ouch.hpp"
@@ -963,6 +965,324 @@ static void test_mold_udp64() {
     CHECK(t.expected() == 11);
 }
 
+static void test_itch_encode_roundtrip() {
+    const char stock[8] = {'M','B','T','E','S','T',' ',' '};
+    std::vector<uint8_t> b;
+    itch::Message m{};
+
+    itch::encode_add(b, 7, 42, 'B', 500, stock, 1234);
+    CHECK(b.size() == 36);
+    CHECK(itch::parse(b.data(), b.size(), m));
+    CHECK(m.type == itch::MsgType::Add && m.ref == 42);
+    CHECK(m.side == Side::Buy && m.qty == 500 && m.price == 1234);
+
+    b.clear();
+    itch::encode_execute(b, 8, 42, 100, 9001);
+    CHECK(b.size() == 31);
+    CHECK(itch::parse(b.data(), b.size(), m));
+    CHECK(m.type == itch::MsgType::Execute && m.ref == 42 && m.qty == 100);
+
+    b.clear();
+    itch::encode_execute_px(b, 9, 42, 60, 9002, 1230);
+    CHECK(b.size() == 36);
+    CHECK(itch::parse(b.data(), b.size(), m));
+    CHECK(m.type == itch::MsgType::Execute && m.qty == 60 && m.price == 1230);
+
+    b.clear();
+    itch::encode_cancel(b, 10, 42, 25);
+    CHECK(b.size() == 23);
+    CHECK(itch::parse(b.data(), b.size(), m));
+    CHECK(m.type == itch::MsgType::Cancel && m.qty == 25);
+
+    b.clear();
+    itch::encode_delete(b, 11, 42);
+    CHECK(b.size() == 19);
+    CHECK(itch::parse(b.data(), b.size(), m));
+    CHECK(m.type == itch::MsgType::Delete && m.ref == 42);
+
+    b.clear();
+    itch::encode_action(b, 12, stock, 'H');
+    CHECK(b.size() == 25);
+    CHECK(itch::parse(b.data(), b.size(), m));
+    CHECK(m.type == itch::MsgType::Action && m.state == 'H');
+    CHECK(std::memcmp(m.stock, stock, 8) == 0);
+
+    // Q and P are tape-only: correct sizes, skipped by the parser.
+    b.clear();
+    itch::encode_cross(b, 13, 12345, stock, 1232, 9003);
+    CHECK(b.size() == 40);
+    CHECK(!itch::parse(b.data(), b.size(), m));
+    b.clear();
+    itch::encode_trade(b, 14, 'B', 75, stock, 1231, 9004);
+    CHECK(b.size() == 44);
+    CHECK(!itch::parse(b.data(), b.size(), m));
+
+    // File framing: 2-byte BE length prefix.
+    std::vector<uint8_t> stream;
+    itch::frame(stream, b);
+    CHECK(stream.size() == b.size() + 2);
+    CHECK((size_t(stream[0]) << 8 | stream[1]) == b.size());
+}
+
+// Drain a publisher and parse everything the parser understands.
+static std::vector<itch::Message> pub_drain(itch::Publisher& pub,
+                                            std::vector<char>* raw_types
+                                            = nullptr) {
+    std::vector<itch::Message> v;
+    for (auto& body : pub.take_messages()) {
+        if (raw_types) raw_types->push_back(static_cast<char>(body[0]));
+        itch::Message m{};
+        if (itch::parse(body.data(), body.size(), m)) v.push_back(m);
+    }
+    return v;
+}
+
+static void test_itch_publisher() {
+    // Rest -> A; fill -> maker-side E; remainder -> A; cancel -> D.
+    {
+        itch::Publisher pub(1, 10000, "MBTEST");
+        OrderId ask = pub.submit_limit(Side::Sell, 100, 5);
+        auto v = pub_drain(pub);
+        CHECK(v.size() == 1 && v[0].type == itch::MsgType::Add);
+        CHECK(v[0].side == Side::Sell && v[0].qty == 5 && v[0].price == 100);
+        uint64_t ask_ref = v[0].ref;
+
+        OrderId bid = pub.submit_limit(Side::Buy, 100, 8);
+        v = pub_drain(pub);
+        CHECK(v.size() == 2);
+        CHECK(v[0].type == itch::MsgType::Execute);
+        CHECK(v[0].ref == ask_ref && v[0].qty == 5);   // maker prints
+        CHECK(v[1].type == itch::MsgType::Add);        // taker remainder
+        CHECK(v[1].side == Side::Buy && v[1].qty == 3);
+        CHECK(ask != kInvalidOrderId);
+        uint64_t bid_ref = v[1].ref;
+
+        CHECK(pub.cancel(bid));
+        v = pub_drain(pub);
+        CHECK(v.size() == 1 && v[0].type == itch::MsgType::Delete);
+        CHECK(v[0].ref == bid_ref);
+    }
+    // Kills never touch the displayed book: no messages at all.
+    {
+        itch::Publisher pub(1, 10000, "MBTEST");
+        pub.submit_limit(Side::Sell, 100, 5);
+        pub_drain(pub);
+        pub.submit_limit(Side::Buy, 100, 5, TimeInForce::PostOnly);  // killed
+        pub.submit_limit(Side::Buy, 90, 5, TimeInForce::IOC);        // misses
+        pub.submit_limit(Side::Buy, 100, 50, TimeInForce::FOK);      // fails
+        pub.submit_stop(Side::Buy, 105, 5);                          // parks
+        CHECK(pub.take_messages().empty());
+    }
+    // Amend-down -> X; reprice -> D + A; reduce-to-zero -> D.
+    {
+        itch::Publisher pub(1, 10000, "MBTEST");
+        OrderId o = pub.submit_limit(Side::Buy, 95, 10);
+        pub_drain(pub);
+        CHECK(pub.modify(o, 95, 6));                   // silent amend
+        auto v = pub_drain(pub);
+        CHECK(v.size() == 1 && v[0].type == itch::MsgType::Cancel);
+        CHECK(v[0].qty == 4);                          // the shrink delta
+
+        CHECK(pub.modify(o, 96, 6));                   // cancel-replace
+        v = pub_drain(pub);
+        CHECK(v.size() == 2);
+        CHECK(v[0].type == itch::MsgType::Delete);
+        CHECK(v[1].type == itch::MsgType::Add && v[1].price == 96);
+
+        CHECK(pub.reduce(o, 2));
+        v = pub_drain(pub);
+        CHECK(v.size() == 1 && v[0].type == itch::MsgType::Cancel &&
+              v[0].qty == 2);
+        CHECK(pub.reduce(o, 4));                       // removes silently
+        v = pub_drain(pub);
+        CHECK(v.size() == 1 && v[0].type == itch::MsgType::Delete);
+    }
+    // Iceberg: E exhausts the clip, then a *new ref* adds the next clip;
+    // reserve-only shaves publish nothing.
+    {
+        itch::Publisher pub(1, 10000, "MBTEST");
+        OrderId ice = pub.submit_iceberg(Side::Sell, 100, 25, 10);
+        auto v = pub_drain(pub);
+        CHECK(v.size() == 1 && v[0].qty == 10);        // clip only, dark rest
+        uint64_t clip1 = v[0].ref;
+
+        CHECK(pub.reduce(ice, 5));                     // shaves reserve: 20 left
+        CHECK(pub.take_messages().empty());
+
+        pub.submit_limit(Side::Buy, 100, 12);
+        v = pub_drain(pub);
+        CHECK(v.size() == 3);
+        CHECK(v[0].type == itch::MsgType::Execute && v[0].ref == clip1 &&
+              v[0].qty == 10);
+        CHECK(v[1].type == itch::MsgType::Add && v[1].qty == 10);
+        CHECK(v[1].ref != clip1);                      // fresh clip, fresh ref
+        CHECK(v[2].type == itch::MsgType::Execute && v[2].ref == v[1].ref &&
+              v[2].qty == 2);
+    }
+    // STP CancelMaker: the resting order's D hits the tape.
+    {
+        itch::Publisher pub(1, 10000, "MBTEST");
+        pub.submit_limit(Side::Sell, 100, 5, TimeInForce::GTC, 7);
+        auto v = pub_drain(pub);
+        uint64_t mine = v[0].ref;
+        pub.submit_limit(Side::Buy, 100, 5, TimeInForce::GTC, 7,
+                         StpPolicy::CancelMaker);
+        v = pub_drain(pub);
+        CHECK(v.size() == 2);
+        CHECK(v[0].type == itch::MsgType::Delete && v[0].ref == mine);
+        CHECK(v[1].type == itch::MsgType::Add);        // taker rested
+    }
+    // Auction: H halt, crossed A's, C prints + Q aggregate, H resume;
+    // hidden reserve shows up only in the Q volume.
+    {
+        itch::Publisher pub(1, 10000, "MBTEST");
+        std::vector<char> types;
+        pub.halt();
+        pub.submit_iceberg(Side::Sell, 100, 30, 5);
+        pub.submit_limit(Side::Buy, 100, 12);
+        pub_drain(pub, &types);
+        CHECK((types == std::vector<char>{'H', 'A', 'A'}));
+
+        CHECK(pub.uncross() == 12);
+        types.clear();
+        auto v = pub_drain(pub, &types);
+        // C for the bid (12), C for the ask clip's displayed 5, then the
+        // renormalized clip's A, then the aggregate Q. The 7 hidden
+        // shares that traded appear only in the Q volume.
+        CHECK((types == std::vector<char>{'C', 'C', 'A', 'Q'}));
+        CHECK(v.size() == 3);                          // Q doesn't parse
+        CHECK(v[0].qty == 12 && v[0].price == 100);    // taker side first
+        CHECK(v[1].qty == 5);                          // displayed part only
+        CHECK(v[2].type == itch::MsgType::Add && v[2].qty == 5);
+        pub.resume();
+        types.clear();
+        auto acts = pub_drain(pub, &types);
+        CHECK((types == std::vector<char>{'H'}));      // trading action...
+        CHECK(acts.size() == 1 && acts[0].state == 'T');  // ...state resumed
+        CHECK(pub.engine().depth_at(Side::Sell, 100) == 5);   // fresh clip
+        CHECK(pub.engine().hidden_at(Side::Sell, 100) == 13);
+    }
+    // Stop firing publishes only its consequences: maker E, remainder A.
+    {
+        itch::Publisher pub(1, 10000, "MBTEST");
+        pub.submit_limit(Side::Sell, 100, 2);
+        pub.submit_limit(Side::Buy, 100, 2);           // last = 100
+        pub.submit_limit(Side::Sell, 104, 3);
+        pub_drain(pub);
+        pub.submit_stop_limit(Side::Buy, 100, 105, 10);  // fires now
+        std::vector<char> types;
+        auto v = pub_drain(pub, &types);
+        CHECK((types == std::vector<char>{'E', 'A'}));
+        CHECK(v[0].qty == 3);                          // maker at 104
+        CHECK(v[1].qty == 7 && v[1].price == 105);     // remainder rests
+    }
+}
+
+static void test_itch_publisher_roundtrip() {
+    // The headline property: a consumer that parses the published stream
+    // and applies it through BookBuilder reconstructs the *identical*
+    // displayed book -- levels, quantities, order counts, best prices --
+    // through random flow spanning every order type and auction cycles.
+    itch::Publisher pub(1, 2000, "MBTEST", 1 << 16);
+    Recorder r2;
+    Engine rebuilt(1, 2000, r2, 1 << 16);
+    itch::BookBuilder builder;
+
+    uint64_t s = 0x8FB3C5D1A7E92413ull;
+    auto rng = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+    std::vector<OrderId> live;
+
+    auto pump_feed = [&] {
+        for (auto& body : pub.take_messages()) {
+            itch::Message m{};
+            if (itch::parse(body.data(), body.size(), m))
+                builder.apply(rebuilt, m);
+        }
+    };
+    auto books_equal = [&] {
+        for (Side side : {Side::Buy, Side::Sell}) {
+            auto a = pub.engine().top_levels(side, 1 << 12);
+            auto b = rebuilt.top_levels(side, 1 << 12);
+            CHECK(a.size() == b.size());
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                CHECK(a[i].price == b[i].price);
+                CHECK(a[i].qty == b[i].qty);
+                CHECK(a[i].orders == b[i].orders);
+            }
+        }
+        CHECK(pub.engine().has_bid() == rebuilt.has_bid());
+        CHECK(pub.engine().has_ask() == rebuilt.has_ask());
+        if (pub.engine().has_bid())
+            CHECK(pub.engine().best_bid() == rebuilt.best_bid());
+        if (pub.engine().has_ask())
+            CHECK(pub.engine().best_ask() == rebuilt.best_ask());
+    };
+
+    for (int i = 0; i < 40000; ++i) {
+        if (i % 4000 == 0) {
+            pub.halt();
+        } else if (i % 4000 == 600) {
+            pub.uncross();
+            pub.resume();
+        }
+        uint64_t roll = rng() % 100;
+        Price px = 900 + static_cast<Price>(rng() % 200);
+        Side side = (rng() & 1) ? Side::Buy : Side::Sell;
+        OwnerId owner = static_cast<OwnerId>(rng() % 3);
+        StpPolicy stp = static_cast<StpPolicy>(rng() % 3);
+        if (roll < 35 || live.empty()) {
+            OrderId id = pub.submit_limit(side, px, 1 + rng() % 50,
+                                          TimeInForce::GTC, owner, stp);
+            if (id != kInvalidOrderId) live.push_back(id);
+        } else if (roll < 45) {
+            OrderId id = pub.submit_iceberg(side, px, 1 + rng() % 60,
+                                            1 + rng() % 10, TimeInForce::GTC,
+                                            owner, stp);
+            if (id != kInvalidOrderId) live.push_back(id);
+        } else if (roll < 60) {
+            size_t k = rng() % live.size();
+            pub.cancel(live[k]);
+            live[k] = live.back();
+            live.pop_back();
+        } else if (roll < 67) {
+            pub.submit_market(side, 1 + rng() % 60, owner, stp);
+        } else if (roll < 74) {
+            OrderId id = pub.submit_limit(side, px, 1 + rng() % 50,
+                                          (roll & 1) ? TimeInForce::IOC
+                                                     : TimeInForce::PostOnly,
+                                          owner, stp);
+            if (id != kInvalidOrderId) live.push_back(id);
+        } else if (roll < 82) {
+            Price trig = 900 + static_cast<Price>(rng() % 200);
+            OrderId id =
+                (roll & 1)
+                    ? pub.submit_stop(side, trig, 1 + rng() % 20, owner, stp)
+                    : pub.submit_stop_limit(
+                          side, trig, 900 + static_cast<Price>(rng() % 200),
+                          1 + rng() % 20, owner, stp);
+            if (id != kInvalidOrderId) live.push_back(id);
+        } else if (roll < 92) {
+            pub.modify(live[rng() % live.size()], px, 1 + rng() % 50);
+        } else {
+            pub.reduce(live[rng() % live.size()], 1 + rng() % 10);
+        }
+        pump_feed();
+        if (i % 250 == 0) books_equal();
+    }
+    pub.resume();
+    pump_feed();
+    books_equal();
+
+    // Displayed-order accounting: the rebuilt engine holds exactly the
+    // displayed orders of the source (its own ids, same book).
+    size_t displayed = 0;
+    pub.engine().visit_levels(Side::Buy, 1 << 12,
+                              [&](const LevelView& v) { displayed += v.orders; });
+    pub.engine().visit_levels(Side::Sell, 1 << 12,
+                              [&](const LevelView& v) { displayed += v.orders; });
+    CHECK(rebuilt.open_orders() == displayed);
+}
+
 // Space-pad a token the way it appears on the wire.
 static std::string tok(const char* s) {
     std::string t(s);
@@ -1351,6 +1671,8 @@ static void test_stress_invariants() {
 }
 
 // Records the full ordered event tape so two engines can be compared.
+// Includes the optional on_rest hook, so deferred-mode buffering of Rest
+// events is covered by the parity test too.
 struct Tape {
     std::vector<std::array<long, 4>> ev;  // {kind, id/maker, price, qty}
     void on_accept(OrderId id, Side, Price p, Qty q) {
@@ -1361,6 +1683,9 @@ struct Tape {
     }
     void on_cancel(OrderId id) { ev.push_back({'C', (long)id, 0, 0}); }
     void on_reject(OrderId id) { ev.push_back({'R', (long)id, 0, 0}); }
+    void on_rest(OrderId id, Side, Price p, Qty q) {
+        ev.push_back({'B', (long)id, (long)p, (long)q});
+    }
 };
 
 template <typename Eng>
@@ -1540,6 +1865,9 @@ int main() {
     test_bitmap();
     test_spsc_ring();
     test_mold_udp64();
+    test_itch_encode_roundtrip();
+    test_itch_publisher();
+    test_itch_publisher_roundtrip();
     test_ouch_codec();
     test_ouch_gateway();
     test_stress_invariants();

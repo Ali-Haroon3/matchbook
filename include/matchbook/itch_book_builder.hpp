@@ -54,6 +54,14 @@ public:
                 refmap_[m.new_ref] = id;
                 break;
             }
+            case MsgType::Action: {
+                // Trading action: mirror the venue's halt state so adds
+                // published during a call phase rest without matching
+                // (the pre-open book can legitimately be crossed).
+                if (m.state == 'H') e.halt();
+                else if (m.state == 'T') e.resume();
+                break;
+            }
             default:
                 break;
         }

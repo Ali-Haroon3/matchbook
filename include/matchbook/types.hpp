@@ -46,11 +46,24 @@ struct Trade {
 // Default event handler: all no-ops. The engine is templated on a Handler
 // policy so event dispatch compiles down to nothing when unused -- no
 // virtual calls or std::function on the hot path.
+//
+// A handler may additionally define
+//     void on_rest(OrderId, Side, Price, Qty displayed);
+// to be told whenever quantity becomes *visible* in the book: an order
+// (or remainder) resting after matching, and each iceberg clip as it is
+// replenished. Detected at compile time; handlers without it pay nothing.
+// Market-data publishers need this hook -- accept announces intent, but
+// only rest changes the displayed book.
 struct NullHandler {
     void on_accept(OrderId, Side, Price, Qty) noexcept {}
     void on_trade(const Trade&) noexcept {}
     void on_cancel(OrderId) noexcept {}
     void on_reject(OrderId) noexcept {}
+};
+
+template <typename H>
+concept HasOnRest = requires(H& h) {
+    h.on_rest(OrderId{}, Side::Buy, Price{}, Qty{});
 };
 
 }  // namespace matchbook
