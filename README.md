@@ -261,6 +261,45 @@ an optional compile-time `on_rest` handler callback (accept announces
 intent; only rest changes the displayed book) and an `order_qty`
 accessor for diffing silent amends.
 
+**Late joiners** get a GLIMPSE-style snapshot: `Publisher::snapshot()`
+serializes the displayed book as out-of-band Add messages under the
+live references (leading with the halt state, since a call-phase book
+legitimately stands crossed) and returns the sequence to splice into
+the live stream at; `mold::SequenceTracker` takes that starting
+sequence, so replayed pre-join packets skip as already-seen rather than
+double-applying or counting as gaps. The test joins mid-stream, inside
+a halt, off snapshot + full-wire replay, and tracks the source book
+level-for-level to the end.
+
+## Multi-symbol venues
+
+`venue.hpp` runs one engine per symbol -- each with its own price band
+and its own Handler instance, so event streams stay attributable --
+registered explicitly, because the flat per-symbol level arrays cost
+band x 2 x sizeof(Level) and that belongs in the caller's hands, not
+hidden behind whole-tape magic. `itch::VenueBookBuilder` routes a mixed
+feed across the books via one day-unique ref map, honors per-symbol
+trading actions, and offers an auto-band mode (register a symbol on its
+first Add, banded around that price; later out-of-band adds count as
+dropped instead of growing books without bound). `replay` now takes
+multiple symbols and builds them side by side.
+
+## Pre-trade risk (market access gate)
+
+`risk_gate.hpp` is the 15c3-5-shaped layer: a `RiskGate` owns the
+engine, mirrors its order-entry surface, and refuses flow before the
+engine sees it -- kill switch (with `kill_and_cancel_all()` flattening
+resting orders and pending stops), a clockless per-window message
+budget, an optional market-order ban, per-order quantity and notional
+caps, a price collar around the last trade on every price that can
+execute, an open-order cap, and a per-owner net-filled position limit
+with a worst-case pre-check fed by the gate's own fill tracking.
+Rejections are synchronous return values with recorded reasons and
+counters. Two absolutes match how real gates behave: risk *reduction*
+(cancel/reduce) is never blocked, and a default-limits gate is a pure
+passthrough -- pinned by an event-tape parity test against a bare
+engine.
+
 ## Order entry (OUCH-style)
 
 `ouch.hpp` is the client-facing counterpart to the ITCH side: an
@@ -344,7 +383,10 @@ Q-learning quoter (bucketing bounds, update math, uncrossed quotes), and
 the re-entrant engine (event-tape parity with the default mode, a handler
 that cancels the maker from inside on_trade, a handler that re-submits
 from a fill), the ITCH encoders and publisher (mapping unit tests plus
-the 40k-op round-trip rebuild above), plus two randomized fuzzes — run
+the 40k-op round-trip rebuild above), the snapshot/late-join splice
+(including a mid-halt join off a crossed book), the multi-symbol venue
+and its routing builder, the risk gate (every limit tripped and the
+default-limits passthrough parity), plus two randomized fuzzes — run
 against both the default and deferred-event engines — throwing the full
 order-type zoo at the book (200k ops) and driving halt/uncross/resume
 cycles under random flow (60k ops), asserting the book is never locked
@@ -375,6 +417,9 @@ suite in Release and under ASAN + UBSAN.
 - ~~OUCH-style binary order entry with a token-tracking session gateway~~ done: `ouch.hpp`
 - ~~Outbound ITCH publisher with a feed-consumer round-trip proof~~ done: `itch_publisher.hpp`, `itch_encode.hpp`
 - ~~Differential fuzz against a naive reference implementation~~ done: `tests/reference_engine.hpp`
+- ~~Multi-symbol venue with a routing book builder~~ done: `venue.hpp`, `itch::VenueBookBuilder`
+- ~~Pre-trade risk gate (15c3-5-style market access controls)~~ done: `risk_gate.hpp`
+- ~~Snapshot/late-join recovery (GLIMPSE-style)~~ done: `Publisher::snapshot()`, spliced `SequenceTracker`
 
 ## License
 
