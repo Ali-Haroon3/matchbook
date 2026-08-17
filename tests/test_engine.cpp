@@ -11,6 +11,7 @@
 #include "matchbook/itch_book_builder.hpp"
 #include "matchbook/itch_encode.hpp"
 #include "matchbook/itch_publisher.hpp"
+#include "reference_engine.hpp"
 #include "matchbook/matching_engine.hpp"
 #include "matchbook/mold_udp64.hpp"
 #include "matchbook/ouch.hpp"
@@ -1670,6 +1671,155 @@ static void test_stress_invariants() {
     stress_auction_cycles<ReentrantMatchingEngine<Recorder>>(0xE7037ED1A0B428DBull);
 }
 
+// Full-fidelity event record for the differential fuzz: every callback,
+// every field, in order.
+struct DiffTape {
+    std::vector<std::array<long long, 6>> ev;
+    void on_accept(OrderId id, Side s, Price p, Qty q) {
+        ev.push_back({'A', (long long)id, 0, p, (long long)q, (long long)s});
+    }
+    void on_trade(const Trade& t) {
+        ev.push_back({'T', (long long)t.taker, (long long)t.maker, t.price,
+                      (long long)t.qty, (long long)t.taker_side});
+    }
+    void on_cancel(OrderId id) {
+        ev.push_back({'C', (long long)id, 0, 0, 0, 0});
+    }
+    void on_reject(OrderId id) {
+        ev.push_back({'R', (long long)id, 0, 0, 0, 0});
+    }
+    void on_rest(OrderId id, Side s, Price p, Qty q) {
+        ev.push_back({'B', (long long)id, 0, p, (long long)q, (long long)s});
+    }
+};
+
+// Drive the fast engine and the naive reference through identical
+// operations; every return value, every event (in order, all fields),
+// and the whole book (levels, hidden, counts, last trade, pending
+// stops, open orders) must agree. The reference is the specification;
+// any divergence is a bug in one of them.
+template <typename Eng>
+static void differential_fuzz(uint64_t seed, int n_ops) {
+    DiffTape tf, tr;
+    Eng fast(1, 2000, tf, 1 << 16);
+    refmodel::ReferenceEngine<DiffTape> ref(1, 2000, tr);
+    uint64_t s = seed;
+    auto rng = [&]() { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; };
+    std::vector<OrderId> live;
+    size_t checked = 0;
+
+    auto sync_tapes = [&] {
+        CHECK(tf.ev.size() == tr.ev.size());
+        size_t n = tf.ev.size() < tr.ev.size() ? tf.ev.size() : tr.ev.size();
+        for (; checked < n; ++checked) CHECK(tf.ev[checked] == tr.ev[checked]);
+    };
+    auto sync_books = [&] {
+        CHECK(fast.has_bid() == ref.has_bid());
+        CHECK(fast.has_ask() == ref.has_ask());
+        if (fast.has_bid() && ref.has_bid())
+            CHECK(fast.best_bid() == ref.best_bid());
+        if (fast.has_ask() && ref.has_ask())
+            CHECK(fast.best_ask() == ref.best_ask());
+        CHECK(fast.has_last_trade() == ref.has_last_trade());
+        if (fast.has_last_trade() && ref.has_last_trade())
+            CHECK(fast.last_trade() == ref.last_trade());
+        CHECK(fast.pending_stops() == ref.pending_stops());
+        CHECK(fast.open_orders() == ref.open_orders());
+        for (Side side : {Side::Buy, Side::Sell}) {
+            auto a = fast.top_levels(side, 1 << 12);
+            auto b = ref.levels(side);
+            CHECK(a.size() == b.size());
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+                CHECK(a[i].price == b[i][0]);
+                CHECK((long long)a[i].qty == b[i][1]);
+                CHECK((long long)a[i].orders == b[i][2]);
+                CHECK(fast.hidden_at(side, a[i].price) ==
+                      ref.hidden_at(side, a[i].price));
+            }
+        }
+    };
+
+    for (int i = 0; i < n_ops; ++i) {
+        if (i % 3000 == 0) {
+            fast.halt();
+            ref.halt();
+        } else if (i % 3000 == 500) {
+            CHECK(fast.uncross() == ref.uncross());
+            fast.resume();
+            ref.resume();
+        }
+        uint64_t roll = rng() % 100;
+        Price px = 900 + static_cast<Price>(rng() % 200);
+        Qty q = 1 + rng() % 50;
+        Side side = (rng() & 1) ? Side::Buy : Side::Sell;
+        OwnerId owner = static_cast<OwnerId>(rng() % 3);
+        StpPolicy stp = static_cast<StpPolicy>(rng() % 3);
+        if (roll < 30 || live.empty()) {
+            TimeInForce tif =
+                (roll < 6) ? TimeInForce::PostOnly
+                           : (roll < 9 ? TimeInForce::IOC
+                                       : (roll < 12 ? TimeInForce::FOK
+                                                    : TimeInForce::GTC));
+            OrderId a = fast.submit_limit(side, px, q, tif, owner, stp);
+            OrderId b = ref.submit_limit(side, px, q, tif, owner, stp);
+            CHECK(a == b);
+            if (a != kInvalidOrderId) live.push_back(a);
+        } else if (roll < 42) {
+            Qty disp = 1 + rng() % 10;
+            Qty total = 1 + rng() % 60;
+            OrderId a = fast.submit_iceberg(side, px, total, disp,
+                                            TimeInForce::GTC, owner, stp);
+            OrderId b = ref.submit_iceberg(side, px, total, disp,
+                                           TimeInForce::GTC, owner, stp);
+            CHECK(a == b);
+            if (a != kInvalidOrderId) live.push_back(a);
+        } else if (roll < 57) {
+            size_t k = rng() % live.size();
+            CHECK(fast.cancel(live[k]) == ref.cancel(live[k]));
+            live[k] = live.back();
+            live.pop_back();
+        } else if (roll < 64) {
+            Qty mq = 1 + rng() % 60;
+            CHECK(fast.submit_market(side, mq, owner, stp) ==
+                  ref.submit_market(side, mq, owner, stp));
+        } else if (roll < 74) {
+            Price trig = 900 + static_cast<Price>(rng() % 200);
+            Qty sq = 1 + rng() % 20;
+            OrderId a, b;
+            if (roll & 1) {
+                a = fast.submit_stop(side, trig, sq, owner, stp);
+                b = ref.submit_stop(side, trig, sq, owner, stp);
+            } else {
+                Price lim = 900 + static_cast<Price>(rng() % 200);
+                a = fast.submit_stop_limit(side, trig, lim, sq, owner, stp);
+                b = ref.submit_stop_limit(side, trig, lim, sq, owner, stp);
+            }
+            CHECK(a == b);
+            if (a != kInvalidOrderId) live.push_back(a);
+        } else if (roll < 88) {
+            OrderId id = live[rng() % live.size()];
+            CHECK(fast.modify(id, px, q) == ref.modify(id, px, q));
+        } else {
+            OrderId id = live[rng() % live.size()];
+            Qty d = 1 + rng() % 10;
+            CHECK(fast.reduce(id, d) == ref.reduce(id, d));
+        }
+        sync_tapes();
+        if (i % 50 == 0) sync_books();
+    }
+    fast.resume();
+    ref.resume();
+    sync_tapes();
+    sync_books();
+}
+
+static void test_differential_reference() {
+    differential_fuzz<MatchingEngine<DiffTape>>(0x1F2E3D4C5B6A7988ull, 30000);
+    differential_fuzz<MatchingEngine<DiffTape>>(0xB5AD4ECEDA1CE2A9ull, 30000);
+    differential_fuzz<ReentrantMatchingEngine<DiffTape>>(0x93D765DD2F5B4C61ull,
+                                                         15000);
+}
+
 // Records the full ordered event tape so two engines can be compared.
 // Includes the optional on_rest hook, so deferred-mode buffering of Rest
 // events is covered by the parity test too.
@@ -1871,6 +2021,7 @@ int main() {
     test_ouch_codec();
     test_ouch_gateway();
     test_stress_invariants();
+    test_differential_reference();
     test_reentrant_engine();
     test_rl_quoter();
 

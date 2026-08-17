@@ -4,10 +4,13 @@ A low-latency limit order book and matching engine in C++20, with a Nasdaq
 ITCH 5.0 feed handler, a lock-free SPSC pipeline between the feed and
 matching threads, and an Avellaneda-Stoikov market-making layer on top.
 The engine speaks the full exchange order-type zoo -- IOC/FOK/post-only,
-icebergs, stops and stop-limits, self-trade prevention -- and runs call
-auctions with an equilibrium-price uncross next to continuous trading.
+icebergs, stops and stop-limits, self-trade prevention -- runs call
+auctions with an equilibrium-price uncross next to continuous trading,
+and closes the loop as a venue: OUCH-style order entry in, ITCH 5.0
+market data out, with a round-trip test proving a consumer of the
+published feed reconstructs the identical displayed book.
 
-Zero external dependencies.Header-only core. Builds clean with
+Zero external dependencies. Header-only core. Builds clean with
 `-Wall -Wextra -Wpedantic -Wshadow` and runs clean under ASAN + UBSAN.
 Optional pybind11 bindings for research workflows (off by default; the
 core stays dependency-free).
@@ -234,6 +237,30 @@ address argument selects the NIC, as production multicast feeds do;
 bit-identical to the file replay's. A receiver that misses the
 end-of-session packet exits after 5s of feed silence instead of hanging.
 
+## Market data out (ITCH publisher)
+
+`itch_publisher.hpp` is the other half of the venue: a `Publisher`
+wraps the engine and publishes its life as spec-layout ITCH 5.0
+(`itch_encode.hpp` holds the encoders), describing the *displayed*
+book. Resting quantity and every replenished iceberg clip go out as
+`A` with a fresh reference; continuous fills as maker-side `E`; auction
+fills as `C` at the clearing price plus one aggregate `Q` cross whose
+volume is where hidden participation shows up; silent in-place amends
+as `X`/`D` diffed across the call; halts as `H` trading actions, which
+`BookBuilder` now honors so a consumer's book may stand crossed through
+a call phase exactly like the venue's. Kills, rejects, and pending
+stops publish nothing -- they never touched the displayed book.
+
+The property that keeps this honest: the round-trip test drives 40k
+random operations spanning every order type and auction cycles, parses
+the published stream with the repo's own parser, applies it through
+`BookBuilder` into a second engine, and requires that book to match the
+source level-for-level -- prices, quantities, order counts, best
+prices -- continuously. The publisher needs exactly two engine hooks:
+an optional compile-time `on_rest` handler callback (accept announces
+intent; only rest changes the displayed book) and an `order_qty`
+accessor for diffing silent amends.
+
 ## Order entry (OUCH-style)
 
 `ouch.hpp` is the client-facing counterpart to the ITCH side: an
@@ -316,12 +343,23 @@ outbound into Mold), the ring, and the
 Q-learning quoter (bucketing bounds, update math, uncrossed quotes), and
 the re-entrant engine (event-tape parity with the default mode, a handler
 that cancels the maker from inside on_trade, a handler that re-submits
-from a fill), plus two randomized fuzzes — run against both the default
-and deferred-event engines — throwing the full order-type zoo at the
-book (200k ops) and driving halt/uncross/resume cycles under random flow
-(60k ops), asserting the book is never locked or crossed and the
-accounting comes out clean after every operation. CI runs the suite in
-Release and under ASAN + UBSAN.
+from a fill), the ITCH encoders and publisher (mapping unit tests plus
+the 40k-op round-trip rebuild above), plus two randomized fuzzes — run
+against both the default and deferred-event engines — throwing the full
+order-type zoo at the book (200k ops) and driving halt/uncross/resume
+cycles under random flow (60k ops), asserting the book is never locked
+or crossed and the accounting comes out clean after every operation.
+
+On top of the invariant fuzzes sits a **differential fuzz**:
+`tests/reference_engine.hpp` is a second, deliberately naive
+implementation of the entire public contract — `std::map`, `std::deque`,
+linear scans, every order type, STP, stops, auctions — and 75k lockstep
+operations require the fast engine to agree with it on every return
+value, every event in order with all fields, and the whole book state
+(levels, hidden, counts, last trade, stop and open-order accounting)
+throughout. Mutation-checked: breaking FIFO insertion or stop fire
+order makes it fail by the hundreds of thousands of checks. CI runs the
+suite in Release and under ASAN + UBSAN.
 
 ## Roadmap
 
@@ -335,6 +373,8 @@ Release and under ASAN + UBSAN.
 - ~~Call auctions: halt / equilibrium-price uncross / resume~~ done: `halt()`, `uncross()`, `resume()`
 - ~~L2 depth snapshots with per-level order counts~~ done: `top_levels()`, `visit_levels()`
 - ~~OUCH-style binary order entry with a token-tracking session gateway~~ done: `ouch.hpp`
+- ~~Outbound ITCH publisher with a feed-consumer round-trip proof~~ done: `itch_publisher.hpp`, `itch_encode.hpp`
+- ~~Differential fuzz against a naive reference implementation~~ done: `tests/reference_engine.hpp`
 
 ## License
 
