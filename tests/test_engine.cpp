@@ -15,6 +15,7 @@
 #include "matchbook/matching_engine.hpp"
 #include "matchbook/mold_udp64.hpp"
 #include "matchbook/ouch.hpp"
+#include "matchbook/risk_gate.hpp"
 #include "matchbook/spsc_ring.hpp"
 #include "matchbook/level_bitmap.hpp"
 #include "matchbook/strategy/rl_quoter.hpp"
@@ -2069,6 +2070,153 @@ static void test_reentrant_engine() {
     CHECK(e3.open_orders() == 0);
 }
 
+static void test_risk_gate() {
+    using RR = RiskReject;
+    // Default limits = pure passthrough: identical event tape to a bare
+    // engine over the full parity script.
+    {
+        Tape bare_tape, gate_tape;
+        MatchingEngine<Tape> bare(1, 10000, bare_tape);
+        RiskGate<Tape> gate(1, 10000, gate_tape);
+        parity_script(bare);
+        parity_script(gate);
+        CHECK(bare_tape.ev.size() > 10);
+        CHECK(bare_tape.ev == gate_tape.ev);
+    }
+    // Per-order quantity and notional caps.
+    {
+        Recorder r;
+        RiskLimits lim;
+        lim.max_order_qty = 10;
+        lim.max_notional = 1500;
+        RiskGate<Recorder> g(1, 10000, r, lim);
+        CHECK(g.submit_limit(Side::Buy, 100, 11) == kInvalidOrderId);
+        CHECK(g.last_reject() == RR::OrderQty);
+        CHECK(g.submit_limit(Side::Buy, 100, 16) == kInvalidOrderId);
+        CHECK(g.last_reject() == RR::OrderQty);        // qty cap fires first
+        CHECK(g.submit_limit(Side::Buy, 200, 8) == kInvalidOrderId);
+        CHECK(g.last_reject() == RR::Notional);        // 1600 > 1500
+        CHECK(g.submit_limit(Side::Buy, 200, 7) != kInvalidOrderId);
+        CHECK(g.engine().open_orders() == 1);          // only the good one
+        CHECK(g.rejects(RR::OrderQty) == 2 && g.rejects(RR::Notional) == 1);
+    }
+    // Price collar keys off the last trade; silent until a print exists;
+    // stop-market triggers exempt, stop-limit limits checked.
+    {
+        Recorder r;
+        RiskLimits lim;
+        lim.price_collar = 5;
+        RiskGate<Recorder> g(1, 10000, r, lim);
+        CHECK(g.submit_limit(Side::Buy, 500, 1) != kInvalidOrderId);  // no ref
+        CHECK(g.submit_limit(Side::Sell, 500, 1) != kInvalidOrderId); // prints
+        CHECK(g.engine().last_trade() == 500);
+        CHECK(g.submit_limit(Side::Buy, 506, 1) == kInvalidOrderId);
+        CHECK(g.last_reject() == RR::Collar);
+        CHECK(g.submit_limit(Side::Buy, 505, 1) != kInvalidOrderId);
+        CHECK(g.submit_stop(Side::Buy, 900, 1) != kInvalidOrderId);   // exempt
+        CHECK(g.submit_stop_limit(Side::Buy, 900, 890, 1) == kInvalidOrderId);
+        CHECK(g.last_reject() == RR::Collar);
+        CHECK(g.modify(g.submit_limit(Side::Buy, 503, 1), 508, 1) == false);
+        CHECK(g.last_reject() == RR::Collar);
+    }
+    // Open-order cap counts resting orders and pending stops.
+    {
+        Recorder r;
+        RiskLimits lim;
+        lim.max_open_orders = 2;
+        RiskGate<Recorder> g(1, 10000, r, lim);
+        OrderId a = g.submit_limit(Side::Buy, 100, 1);
+        CHECK(g.submit_stop(Side::Sell, 90, 1) != kInvalidOrderId);
+        CHECK(g.submit_limit(Side::Buy, 99, 1) == kInvalidOrderId);
+        CHECK(g.last_reject() == RR::OpenOrders);
+        CHECK(g.cancel(a));                            // reduction always ok
+        CHECK(g.submit_limit(Side::Buy, 99, 1) != kInvalidOrderId);
+    }
+    // Position limit: net filled per owner, worst-case pre-check.
+    {
+        Recorder r;
+        RiskLimits lim;
+        lim.max_position = 10;
+        RiskGate<Recorder> g(1, 10000, r, lim);
+        g.submit_limit(Side::Sell, 100, 8, TimeInForce::GTC, 9);
+        g.submit_limit(Side::Buy, 100, 8, TimeInForce::GTC, 7);   // fills
+        CHECK(g.position(7) == 8 && g.position(9) == -8);
+        CHECK(g.submit_limit(Side::Buy, 100, 3, TimeInForce::GTC, 7) ==
+              kInvalidOrderId);                        // worst case 11 > 10
+        CHECK(g.last_reject() == RR::Position);
+        CHECK(g.submit_limit(Side::Sell, 101, 3, TimeInForce::GTC, 7) !=
+              kInvalidOrderId);                        // reduces exposure
+        CHECK(g.submit_market(Side::Sell, 19, 9) == 19);  // |-8-19| > 10
+        CHECK(g.last_reject() == RR::Position);
+        // Owner 0 is anonymous: never position-checked.
+        CHECK(g.submit_limit(Side::Buy, 100, 500) != kInvalidOrderId);
+    }
+    // Clockless message budget: cancels/reduces are metered but never
+    // refused; new_window resets.
+    {
+        Recorder r;
+        RiskLimits lim;
+        lim.max_messages = 2;
+        RiskGate<Recorder> g(1, 10000, r, lim);
+        OrderId a = g.submit_limit(Side::Buy, 100, 1);
+        CHECK(g.submit_limit(Side::Buy, 99, 1) != kInvalidOrderId);
+        CHECK(g.submit_limit(Side::Buy, 98, 1) == kInvalidOrderId);
+        CHECK(g.last_reject() == RR::MsgBudget);
+        CHECK(g.cancel(a));                            // over budget, allowed
+        g.new_window();
+        CHECK(g.submit_limit(Side::Buy, 98, 1) != kInvalidOrderId);
+        CHECK(g.window_messages() == 1);
+    }
+    // Market orders can be banned without touching limit flow.
+    {
+        Recorder r;
+        RiskLimits lim;
+        lim.allow_market = false;
+        RiskGate<Recorder> g(1, 10000, r, lim);
+        g.submit_limit(Side::Sell, 100, 5);
+        CHECK(g.submit_market(Side::Buy, 5) == 5);
+        CHECK(g.last_reject() == RR::MarketBlocked);
+        CHECK(r.trades.empty());
+        CHECK(g.submit_limit(Side::Buy, 100, 5) != kInvalidOrderId);
+        CHECK(r.trades.size() == 1);
+    }
+    // Kill switch: new flow dies, reductions live, and
+    // kill_and_cancel_all flattens resting orders and pending stops.
+    {
+        Recorder r;
+        RiskGate<Recorder> g(1, 10000, r);
+        OrderId a = g.submit_limit(Side::Buy, 100, 5);
+        g.submit_limit(Side::Sell, 105, 5);
+        g.submit_stop(Side::Sell, 90, 5);
+        g.kill();
+        CHECK(g.submit_limit(Side::Buy, 99, 1) == kInvalidOrderId);
+        CHECK(g.last_reject() == RR::Killed);
+        CHECK(!g.modify(a, 99, 5));
+        CHECK(g.reduce(a, 1));                         // reduction allowed
+        g.clear_kill();
+        CHECK(g.submit_limit(Side::Buy, 99, 1) != kInvalidOrderId);
+
+        g.kill_and_cancel_all();
+        CHECK(g.killed());
+        CHECK(g.engine().open_orders() == 0);
+        CHECK(g.engine().pending_stops() == 0);
+        CHECK(r.cancels.size() == 4);                  // all four flattened
+    }
+    // Positions flow through auction fills too.
+    {
+        Recorder r;
+        RiskLimits lim;
+        lim.max_position = 100;
+        RiskGate<Recorder> g(1, 10000, r, lim);
+        g.halt();
+        g.submit_limit(Side::Sell, 100, 30, TimeInForce::GTC, 3);
+        g.submit_limit(Side::Buy, 100, 30, TimeInForce::GTC, 4);
+        CHECK(g.uncross() == 30);
+        g.resume();
+        CHECK(g.position(4) == 30 && g.position(3) == -30);
+    }
+}
+
 static void test_rl_quoter() {
     using strategy::RLQuoter;
     RLQuoter rl;
@@ -2139,6 +2287,7 @@ int main() {
     test_ouch_gateway();
     test_stress_invariants();
     test_differential_reference();
+    test_risk_gate();
     test_reentrant_engine();
     test_rl_quoter();
 

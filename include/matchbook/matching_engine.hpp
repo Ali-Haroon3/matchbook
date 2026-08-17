@@ -308,6 +308,43 @@ public:
         return out;
     }
 
+    // Visit every resting order on one side in book priority (best price
+    // first, FIFO within a level): f(id, side, price, displayed_qty).
+    // Displayed state only -- iceberg reserve is deliberately absent, so
+    // walking both sides reproduces exactly what a feed consumer sees.
+    // Cold path; do not mutate the engine from f.
+    template <typename F>
+    void visit_orders(Side side, F&& f) const {
+        const auto& levels = (side == Side::Buy) ? bids_ : asks_;
+        int64_t i = (side == Side::Buy) ? best_bid_ : best_ask_;
+        while (i >= 0) {
+            for (const Order* o = levels[static_cast<size_t>(i)].head;
+                 o != nullptr; o = o->next)
+                f(o->id, o->side, o->price, o->qty);
+            i = (side == Side::Buy) ? bid_map_.find_le(i - 1)
+                                    : ask_map_.find_ge(i + 1);
+        }
+    }
+
+    // Visit every pending stop id, in trigger-pump order (buy stops
+    // ascending trigger, then sell stops descending, FIFO within a
+    // trigger). Cold path; do not mutate the engine from f.
+    template <typename F>
+    void visit_stops(F&& f) const {
+        if (stop_bids_.empty()) return;
+        for (int64_t i = stop_bid_map_.find_ge(0); i >= 0;
+             i = stop_bid_map_.find_ge(i + 1))
+            for (const Order* o = stop_bids_[static_cast<size_t>(i)].head;
+                 o != nullptr; o = o->next)
+                f(o->id);
+        for (int64_t i =
+                 stop_ask_map_.find_le(static_cast<int64_t>(n_levels_) - 1);
+             i >= 0; i = stop_ask_map_.find_le(i - 1))
+            for (const Order* o = stop_asks_[static_cast<size_t>(i)].head;
+                 o != nullptr; o = o->next)
+                f(o->id);
+    }
+
     size_t open_orders() const noexcept { return pool_.in_use(); }
 
 private:
